@@ -2815,10 +2815,48 @@ impl Shell {
     pub(super) fn delete_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.delete_space_confirm = None;
         self.mutate(
-            serde_json::json!({ "op": "deleteSpace", "spaceId": space_id }),
+            serde_json::json!({ "op": "deleteSpace", "spaceId": space_id.clone() }),
             cx,
         );
+        // Drop any per-project background override so deleted projects do not
+        // leave orphaned artwork files or stale settings entries behind.
+        let remaining = self
+            .state
+            .read(cx)
+            .spaces
+            .iter()
+            .map(|space| space.id.clone())
+            .filter(|id| id != &space_id)
+            .collect::<Vec<_>>();
+        crate::settings::prune_space_backgrounds(&remaining, cx);
         cx.notify();
+    }
+
+    /// Per-project background picker: choose artwork for one space, reset it
+    /// to the global default, or force no background for that project.
+    fn choose_space_background(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.close_space_menu(cx);
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose Project Background".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                _ => None,
+            };
+            let Some(path) = path else { return };
+            let _ = this.update(cx, |shell: &mut super::Shell, cx| {
+                if let Err(error) = crate::settings::install_space_background(&space_id, &path, cx)
+                {
+                    tracing::warn!(%error, %space_id, "space background install failed");
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Space context menu + rename dialog + delete confirm (appended to the
@@ -2836,8 +2874,14 @@ impl Shell {
             let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
+            let background_id = space_id.clone();
+            let default_id = space_id.clone();
+            let no_background_id = space_id.clone();
+            let has_override = crate::settings::current(cx)
+                .space_backgrounds
+                .contains_key(&space_id);
             let menu = popover::popover_card(&theme)
-                .w(px(170.0))
+                .w(px(210.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_space_menu(cx);
                 }))
@@ -2852,6 +2896,61 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
+                .child(
+                    popover::menu_row(&theme, false, format!("space-menu-background-{space_id}"))
+                        .id("space-menu-background")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_space_background(background_id.clone(), cx)
+                        }))
+                        .child(
+                            icon(icons::FILE_IMAGE)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Background…")),
+                )
+                .when(has_override, |menu| {
+                    menu.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("space-menu-background-default-{space_id}"),
+                        )
+                        .id("space-menu-background-default")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_space_menu(cx);
+                            crate::settings::clear_space_background(&default_id, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            icon(icons::REFRESH)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Use default background")),
+                    )
+                })
+                .when(!has_override, |menu| {
+                    menu.child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("space-menu-background-none-{space_id}"),
+                        )
+                        .id("space-menu-background-none")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_space_menu(cx);
+                            crate::settings::disable_space_background(&no_background_id, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            icon(icons::EYE_CLOSED)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("No background here")),
+                    )
+                })
                 .child(popover::menu_separator())
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))

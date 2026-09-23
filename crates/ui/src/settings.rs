@@ -396,6 +396,182 @@ pub fn set_new_thread_background_effect(effect: NewThreadBackgroundEffect, cx: &
     }
 }
 
+/// Effective artwork for a project (space). `None` space (All projects / no
+/// project) always uses the global default. A present space consults
+/// [`UiSettings::space_backgrounds`]: missing entry inherits the global
+/// default, `Some(None)` forces no background, `Some(Some(bg))` overrides.
+pub fn space_background_for(
+    space_id: Option<&str>,
+    cx: &App,
+) -> Option<NewThreadComposerBackground> {
+    let settings = current(cx);
+    settings.effective_background_for_space(space_id)
+}
+
+/// Effective background effect for a project (space). Missing per-space entry
+/// inherits the global default.
+pub fn space_background_effect_for(space_id: Option<&str>, cx: &App) -> NewThreadBackgroundEffect {
+    let settings = current(cx);
+    settings.effective_background_effect_for_space(space_id)
+}
+
+/// Install artwork for one project (space). Validates + copies into the
+/// managed backgrounds dir exactly like the global installer, then records a
+/// `Some(Some(bg))` override for that space.
+pub fn install_space_background(space_id: &str, source: &Path, cx: &mut App) -> Result<(), String> {
+    let staged = crate::attachments::stage_file(source)?;
+    crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
+        "This background image is unsupported or damaged. Choose a valid image such as PNG or JPEG.".to_string()
+    })?;
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
+    std::fs::create_dir_all(&backgrounds_dir).map_err(|_| {
+        "Unable to save the image. Check folder permissions and try again.".to_string()
+    })?;
+    let extension = Path::new(&staged.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    let destination = backgrounds_dir.join(format!(
+        "new-thread-background-{space_id}-{}.{}",
+        uuid::Uuid::new_v4(),
+        extension
+    ));
+    let temporary = destination.with_extension(format!("{extension}.tmp"));
+    if std::fs::write(&temporary, staged.bytes())
+        .and_then(|_| std::fs::rename(&temporary, &destination))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(
+            "Unable to save the image. Check folder permissions and try again.".to_string(),
+        );
+    }
+    let replacement = NewThreadComposerBackground {
+        path: destination.to_string_lossy().into_owned(),
+        name: staged.name,
+    };
+    let mut next = current(cx);
+    let previous = next
+        .space_backgrounds
+        .insert(space_id.to_owned(), Some(replacement.clone()));
+    if next.save(&data_dir).is_err() {
+        let _ = std::fs::remove_file(&destination);
+        // Roll back the in-memory insert on persistence failure.
+        let mut rollback = current(cx);
+        match previous {
+            Some(prev) => {
+                rollback.space_backgrounds.insert(space_id.to_owned(), prev);
+            }
+            None => {
+                rollback.space_backgrounds.remove(space_id);
+            }
+        }
+        let _ = rollback.save(&data_dir);
+        return Err(
+            "Unable to save the image. Check folder permissions and try again.".to_string(),
+        );
+    }
+    replace(next, SavePolicy::Immediate, cx);
+    if let Some(Some(old)) = previous.as_ref() {
+        remove_managed_new_thread_background(Some(old), &backgrounds_dir);
+    }
+    cx.refresh_windows();
+    Ok(())
+}
+
+/// Reset one project to inherit the global background (`inherit`) or force no
+/// background (`None`). `Some(bg)` is set via [`install_space_background`].
+pub fn clear_space_background(space_id: &str, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.space_backgrounds.remove(space_id);
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+/// Force no artwork for one project even when a global default exists.
+pub fn disable_space_background(space_id: &str, cx: &mut App) {
+    // Retire the previous custom file (if any) after persisting the override.
+    let previous_custom = current(cx)
+        .space_backgrounds
+        .get(space_id)
+        .and_then(|entry| entry.clone());
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.space_backgrounds.insert(space_id.to_owned(), None);
+    }) {
+        if let Some(old) = previous_custom {
+            if let Some(dir) = cx
+                .try_global::<SettingsStore>()
+                .map(|store| store.data_dir.join(NEW_THREAD_BACKGROUND_DIR))
+            {
+                remove_managed_new_thread_background(Some(&old), &dir);
+            }
+        }
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_space_background_effect(
+    space_id: &str,
+    effect: Option<NewThreadBackgroundEffect>,
+    cx: &mut App,
+) {
+    if update(SavePolicy::Immediate, cx, |settings| match effect {
+        Some(effect) => {
+            settings
+                .space_background_effects
+                .insert(space_id.to_owned(), effect);
+        }
+        None => {
+            settings.space_background_effects.remove(space_id);
+        }
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+/// Drop cached per-project overrides for spaces that no longer exist. Called
+/// after a space is deleted; also retires any managed image file the override
+/// owned.
+pub fn prune_space_backgrounds(existing: &[String], cx: &mut App) {
+    let stale: Vec<(String, Option<NewThreadComposerBackground>)> = current(cx)
+        .space_backgrounds
+        .iter()
+        .filter(|(id, _)| !existing.contains(id))
+        .map(|(id, bg)| (id.clone(), bg.clone()))
+        .collect();
+    if stale.is_empty()
+        && current(cx)
+            .space_background_effects
+            .keys()
+            .all(|id| existing.contains(id))
+    {
+        return;
+    }
+    let backgrounds_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.join(NEW_THREAD_BACKGROUND_DIR));
+    if update(SavePolicy::Immediate, cx, |settings| {
+        for (id, _) in &stale {
+            settings.space_backgrounds.remove(id);
+        }
+        settings
+            .space_background_effects
+            .retain(|id, _| existing.contains(id));
+    }) {
+        if let Some(dir) = backgrounds_dir {
+            for (_, bg) in &stale {
+                remove_managed_new_thread_background(bg.as_ref(), &dir);
+            }
+        }
+        cx.refresh_windows();
+    }
+}
+
 fn remove_managed_new_thread_background(
     background: Option<&NewThreadComposerBackground>,
     backgrounds_dir: &Path,
@@ -730,10 +906,24 @@ pub struct UiSettings {
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
     /// Optional device-local artwork behind the blank new-thread composer.
+    /// This is the global default; individual projects (spaces) may override
+    /// it via [`Self::space_backgrounds`] / [`Self::space_background_effects`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
+    /// Global default; per-project overrides live in
+    /// [`Self::space_background_effects`].
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// Per-project (space id) background overrides. Three states per space:
+    /// missing entry = inherit the global default, `Some(None)` = explicitly
+    /// no background for that project, `Some(Some(bg))` = custom artwork.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub space_backgrounds: std::collections::HashMap<String, Option<NewThreadComposerBackground>>,
+    /// Per-project background-effect overrides. Missing entry = inherit the
+    /// global [`Self::new_thread_background_effect`]; present entry (including
+    /// [`NewThreadBackgroundEffect::None`]) = explicit choice for that project.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub space_background_effects: std::collections::HashMap<String, NewThreadBackgroundEffect>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -798,6 +988,8 @@ impl Default for UiSettings {
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            space_backgrounds: std::collections::HashMap::new(),
+            space_background_effects: std::collections::HashMap::new(),
             legacy_accent_color: None,
         }
     }
@@ -1242,6 +1434,37 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
 }
 
 impl UiSettings {
+    /// Effective new-thread artwork for a project (space). `None` space id
+    /// (All projects) always returns the global default.
+    pub fn effective_background_for_space(
+        &self,
+        space_id: Option<&str>,
+    ) -> Option<NewThreadComposerBackground> {
+        match space_id.and_then(|id| self.space_backgrounds.get(id)) {
+            // Missing entry (or All projects): inherit the global default.
+            None => self.new_thread_composer_background.clone(),
+            // Explicit per-project states: Some(None) = no background,
+            // Some(Some(bg)) = custom artwork.
+            Some(entry) => entry.clone(),
+        }
+    }
+
+    /// Effective background effect for a project (space).
+    pub fn effective_background_effect_for_space(
+        &self,
+        space_id: Option<&str>,
+    ) -> NewThreadBackgroundEffect {
+        space_id
+            .and_then(|id| self.space_background_effects.get(id).copied())
+            .unwrap_or(self.new_thread_background_effect)
+    }
+
+    /// Whether a project overrides either the artwork or the effect.
+    pub fn space_has_background_override(&self, space_id: &str) -> bool {
+        self.space_backgrounds.contains_key(space_id)
+            || self.space_background_effects.contains_key(space_id)
+    }
+
     /// Whether this session event may produce audio. Appshot capture has its
     /// own feature-local preference once the Appshots contribution lands.
     pub fn session_sound_enabled(&self, sound: crate::sound::Sound) -> bool {
@@ -1763,6 +1986,62 @@ mod tests {
     }
 
     #[test]
+    fn per_space_background_inherits_global_by_default() {
+        let global = NewThreadComposerBackground {
+            path: "/tmp/global.png".into(),
+            name: "global.png".into(),
+        };
+        let custom = NewThreadComposerBackground {
+            path: "/tmp/space.png".into(),
+            name: "space.png".into(),
+        };
+        let settings = UiSettings {
+            new_thread_composer_background: Some(global.clone()),
+            new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            space_backgrounds: std::collections::HashMap::from([
+                ("custom".to_string(), Some(custom.clone())),
+                ("empty".to_string(), None),
+            ]),
+            space_background_effects: std::collections::HashMap::from([(
+                "custom".to_string(),
+                NewThreadBackgroundEffect::Dither,
+            )]),
+            ..Default::default()
+        };
+        // All-projects (None) and unknown spaces inherit the global default.
+        assert_eq!(
+            settings.effective_background_for_space(None),
+            Some(global.clone())
+        );
+        assert_eq!(
+            settings.effective_background_for_space(Some("unknown")),
+            Some(global.clone())
+        );
+        assert_eq!(
+            settings.effective_background_effect_for_space(Some("unknown")),
+            NewThreadBackgroundEffect::Ascii
+        );
+        // Custom override wins for both artwork and effect.
+        assert_eq!(
+            settings.effective_background_for_space(Some("custom")),
+            Some(custom)
+        );
+        assert_eq!(
+            settings.effective_background_effect_for_space(Some("custom")),
+            NewThreadBackgroundEffect::Dither
+        );
+        // Explicit None forces no background even with a global default.
+        assert_eq!(settings.effective_background_for_space(Some("empty")), None);
+        assert!(settings.space_has_background_override("custom"));
+        assert!(settings.space_has_background_override("empty"));
+        assert!(!settings.space_has_background_override("unknown"));
+        // Round-trips through JSON, preserving the inherit/none/custom split.
+        let restored: UiSettings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+    }
+
+    #[test]
     fn background_cleanup_only_removes_files_owned_by_the_setting() {
         let dir = tempfile::tempdir().unwrap();
         let backgrounds = dir.path().join(NEW_THREAD_BACKGROUND_DIR);
@@ -1992,6 +2271,17 @@ mod tests {
                 name: "background.png".into(),
             }),
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            space_backgrounds: std::collections::HashMap::from([(
+                "space-1".to_string(),
+                Some(NewThreadComposerBackground {
+                    path: "/tmp/zeron/space-1-background.png".into(),
+                    name: "space-1.png".into(),
+                }),
+            )]),
+            space_background_effects: std::collections::HashMap::from([(
+                "space-1".to_string(),
+                NewThreadBackgroundEffect::Dither,
+            )]),
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();

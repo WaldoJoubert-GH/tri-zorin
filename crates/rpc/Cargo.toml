@@ -8,6 +8,9 @@ publish.workspace = true
 [dependencies]
 zeron-proto.workspace = true
 zeron-sync.workspace = true
+# Release metadata + downloads for `upload_binary_over_ssh` (SSH remotes).
+zeron-update.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 futures.workspace = true

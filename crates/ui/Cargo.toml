@@ -107,4 +107,6 @@ mimalloc.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+wry = { version = "0.56.1", default-features = false, features = ["os-webview"] }
+raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }

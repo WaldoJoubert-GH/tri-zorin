@@ -135,6 +135,41 @@ async fn handle_request(
     }
 }
 
+/// Serve one engine over stdio (the SSH remote end: `zeron rpc-stdio`).
+/// Reads ndjson client frames from stdin, writes server frames to stdout —
+/// the same envelopes as the WebSocket and in-memory transports. Stderr stays
+/// free for logs; anything printed to stdout that is not a frame corrupts the
+/// channel (same rule as Zed's remote server).
+pub async fn serve_stdio(service: Arc<dyn crate::RpcService>) {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+    let (in_tx, in_rx) = mpsc::channel::<String>(256);
+    let server = tokio::spawn(serve_connection(service, out_tx, in_rx));
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if stdout.write_all(frame.as_bytes()).await.is_err() {
+                break;
+            }
+            if stdout.write_all(b"\n").await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut lines = BufReader::new(stdin).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if in_tx.send(line).await.is_err() {
+            break;
+        }
+    }
+    server.abort();
+    writer.abort();
+}
+
 /// Accept WebSocket connections forever, serving each with `service`.
 pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcService>) {
     loop {

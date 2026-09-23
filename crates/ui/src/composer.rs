@@ -151,6 +151,35 @@ fn composer_width_changed(previous: Option<f32>, current: f32) -> bool {
 /// Caret blink half-period (standard textarea cadence: ~500ms on / 500ms off).
 pub const CARET_BLINK_MS: u64 = 500;
 
+#[cfg(target_os = "windows")]
+static NATIVE_HOST_PUMP_DEPTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Prevent GPUI caret tasks from re-entering the app while WebView2 creation
+/// synchronously pumps the Windows message loop.
+#[cfg(target_os = "windows")]
+pub(crate) struct NativeHostPumpGuard;
+
+#[cfg(target_os = "windows")]
+impl NativeHostPumpGuard {
+    pub(crate) fn new() -> Self {
+        NATIVE_HOST_PUMP_DEPTH.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+        Self
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for NativeHostPumpGuard {
+    fn drop(&mut self) {
+        NATIVE_HOST_PUMP_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn native_host_pump_in_progress() -> bool {
+    NATIVE_HOST_PUMP_DEPTH.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
 /// Caret blink phase for a time since the last keystroke/caret move: solid
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
@@ -1824,6 +1853,14 @@ impl ComposerInput {
         self.blink_anchor = Instant::now();
     }
 
+    /// Stop the repaint driver before a native host operation that pumps the
+    /// platform event loop synchronously. The normal render path will recreate
+    /// it if this input becomes focused again.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn stop_caret_blink(&mut self) {
+        self.blink_task = None;
+    }
+
     /// Caret paint gate: focused input in an active window, in the "on" blink
     /// phase. Also (re)arms the half-period repaint driver while focused, and
     /// drops it on blur so an unfocused input schedules no frames.
@@ -1839,6 +1876,10 @@ impl ComposerInput {
                     cx.background_executor()
                         .timer(Duration::from_millis(CARET_BLINK_MS))
                         .await;
+                    #[cfg(target_os = "windows")]
+                    if native_host_pump_in_progress() {
+                        continue;
+                    }
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }

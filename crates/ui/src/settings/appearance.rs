@@ -3152,10 +3152,22 @@ impl Render for AppearancePage {
             ],
             None => vec![
                 div()
-                    .child("Add an image behind the composer on empty new threads.")
+                    .child("Default behind the composer on empty new threads.")
+                    .into_any_element(),
+                div()
+                    .child("Each project can set its own background from its menu.")
                     .into_any_element(),
             ],
         };
+        // When a global default exists, remind that projects may override it.
+        let mut background_meta = background_meta;
+        if current_background.is_some() {
+            background_meta.push(
+                div()
+                    .child("Projects can override this from their menu.")
+                    .into_any_element(),
+            );
+        }
         settings_rows.push(
             widgets::card_row(&theme, false)
                 .child(background_tile)
@@ -3163,7 +3175,7 @@ impl Render for AppearancePage {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(widgets::row_title(&theme, "New thread composer background"))
+                        .child(widgets::row_title(&theme, "Default new-thread background"))
                         .child(widgets::meta_line(&theme, background_meta)),
                 )
                 .child(
@@ -3262,6 +3274,98 @@ impl Render for AppearancePage {
                     .border_t_1()
                     .border_color(theme.border)
                     .child(widgets::error_strip(&theme, error))
+                    .into_any_element(),
+            );
+        }
+        // Per-project overrides: each project (space) may carry its own
+        // background; entries missing here inherit the default above. Listed
+        // with a reset so a stale override never traps a project.
+        if !ui_settings.space_backgrounds.is_empty()
+            || !ui_settings.space_background_effects.is_empty()
+        {
+            let mut override_ids: Vec<String> = ui_settings
+                .space_backgrounds
+                .keys()
+                .chain(ui_settings.space_background_effects.keys())
+                .cloned()
+                .collect();
+            override_ids.sort();
+            override_ids.dedup();
+            let mut override_rows = Vec::new();
+            for space_id in override_ids {
+                let label = match ui_settings.space_backgrounds.get(&space_id) {
+                    None => {
+                        let effect = ui_settings
+                            .space_background_effects
+                            .get(&space_id)
+                            .map(|effect| effect.label())
+                            .unwrap_or("default");
+                        format!("{space_id} · effect {effect}")
+                    }
+                    Some(None) => format!("{space_id} · no background"),
+                    Some(Some(background)) => format!("{} · {}", space_id, background.name),
+                };
+                let reset_id = space_id.clone();
+                let reset_id_effect = space_id.clone();
+                override_rows.push(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .py(px(4.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(label)),
+                        )
+                        .child(
+                            compact_action(
+                                &theme,
+                                "Use default",
+                                format!("space-background-reset-{space_id}"),
+                            )
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    crate::settings::clear_space_background(&reset_id, cx);
+                                    crate::settings::set_space_background_effect(
+                                        &reset_id_effect,
+                                        None,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+            settings_rows.push(
+                widgets::card_row(&theme, false)
+                    .child(widgets::row_tile(&theme, icons::FILE_IMAGE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::row_title(&theme, "Project backgrounds"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![div()
+                                    .child("Per-project overrides. Missing projects inherit the default.")
+                                    .into_any_element()],
+                            ))
+                            .child(
+                                div()
+                                    .mt(px(8.0))
+                                    .flex()
+                                    .flex_col()
+                                    .children(override_rows),
+                            ),
+                    )
                     .into_any_element(),
             );
         }

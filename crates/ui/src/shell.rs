@@ -3557,6 +3557,8 @@ impl Shell {
         self.settings.window_geometry = current.window_geometry;
         self.settings.new_thread_composer_background = current.new_thread_composer_background;
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
+        self.settings.space_backgrounds = current.space_backgrounds;
+        self.settings.space_background_effects = current.space_background_effects;
         self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
         self.settings.ui_font_family = current.ui_font_family;
         self.settings.ui_font_size = current.ui_font_size;
@@ -4919,11 +4921,13 @@ impl Shell {
         let island_target = if matches!(self.route, Route::Chat)
             && self.state.read(cx).selected_chat.is_none()
             && self.settings.sidebar_collapsed
-            && settings::current(cx)
-                .new_thread_composer_background
-                .as_ref()
-                .is_some_and(|background| std::path::Path::new(&background.path).is_file())
-        {
+            && {
+                let ui = settings::current(cx);
+                let space = self.state.read(cx).selected_space.clone();
+                ui.effective_background_for_space(space.as_deref())
+                    .as_ref()
+                    .is_some_and(|background| std::path::Path::new(&background.path).is_file())
+            } {
             1.0
         } else {
             0.0
@@ -7417,8 +7421,13 @@ impl Shell {
             (has_spaces || no_project || has_appshots) && has_selection,
         );
         let ui_settings = settings::current(cx);
-        let new_thread_background_setting = ui_settings.new_thread_composer_background;
-        let new_thread_background_effect = ui_settings.new_thread_background_effect;
+        // Per-project background: the new-thread canvas follows the selected
+        // space; "All spaces" (None) falls back to the global default.
+        let canvas_space = self.state.read(cx).selected_space.clone();
+        let new_thread_background_setting =
+            ui_settings.effective_background_for_space(canvas_space.as_deref());
+        let new_thread_background_effect =
+            ui_settings.effective_background_effect_for_space(canvas_space.as_deref());
         let frame_time = self.render_time.unwrap_or_else(std::time::Instant::now);
         // Prewarm even in an established thread. Decode/effect work is not
         // contingent on a hero measurement or a navigation gesture.

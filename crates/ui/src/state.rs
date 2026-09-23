@@ -39,6 +39,7 @@ use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 use crate::change_requests::{
     ChangeRequestClientState, ChangeRequestWatchKey, desired_watch_targets, watch_params,
 };
+use crate::engine_hub::EngineHub;
 
 // Recently viewed transcripts stay renderable while a fresh watch opens. Move
 // ownership on navigation; never clone whale payloads or retain live watches.
@@ -114,6 +115,8 @@ pub enum EngineMode {
     InProcess,
     /// Connected to a separate daemon over localhost WebSocket.
     Remote { url: String },
+    /// Connected to a remote engine over an ssh channel (`zeron rpc-stdio`).
+    Ssh { destination: String },
 }
 
 /// One of the two ways to own an engine connection. Both end at an [`RpcClient`]
@@ -123,6 +126,9 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    fn hub(&self) -> Option<Arc<EngineHub>> {
+        None
+    }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
@@ -256,6 +262,61 @@ impl EngineBackend for RemoteEngine {
         // The daemon outlives this viewport; only stop our readiness probe.
         if let Some(task) = self.lifecycle_task.lock().await.take() {
             task.abort();
+        }
+    }
+}
+
+/// A router-backed handle that keeps the home engine as the default and sends
+/// device-scoped calls to connected SSH engines.
+struct HubEngine {
+    hub: Arc<EngineHub>,
+    client: Arc<RpcClient>,
+    mode: EngineMode,
+}
+
+#[async_trait]
+impl EngineBackend for HubEngine {
+    fn client(&self) -> &RpcClient {
+        &self.client
+    }
+
+    fn mode(&self) -> EngineMode {
+        self.mode.clone()
+    }
+
+    fn hub(&self) -> Option<Arc<EngineHub>> {
+        Some(self.hub.clone())
+    }
+
+    async fn shutdown(&self) {
+        self.hub.shutdown().await;
+    }
+}
+
+/// Remote engine reached directly over an ssh channel (`ssh <target> zeron
+/// rpc-stdio`). The window's whole workspace projection becomes the remote's —
+/// spaces, chats, sessions and transcripts all live in the remote engine's own
+/// docs, so nothing needs to sync through the edge.
+struct SshEngine {
+    client: Arc<RpcClient>,
+    destination: String,
+    /// Owns the ssh child; dropped (killed) with the backend.
+    child: tokio::sync::Mutex<Option<zeron_rpc::ssh::SshHandle>>,
+}
+
+#[async_trait]
+impl EngineBackend for SshEngine {
+    fn client(&self) -> &RpcClient {
+        &self.client
+    }
+    fn mode(&self) -> EngineMode {
+        EngineMode::Ssh {
+            destination: self.destination.clone(),
+        }
+    }
+    async fn shutdown(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            child.kill();
         }
     }
 }
@@ -496,6 +557,11 @@ impl EngineHandle {
 
     #[cfg(test)]
     pub(crate) fn from_test_client(client: RpcClient) -> Self {
+        Self::from_test_client_with_info(client, "local")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_client_with_info(client: RpcClient, device_id: &str) -> Self {
         Self {
             inner: Arc::new(RemoteEngine {
                 client: Arc::new(client),
@@ -503,7 +569,7 @@ impl EngineHandle {
                 lifecycle_task: tokio::sync::Mutex::new(None),
             }),
             engine_info: EngineInfo {
-                device_id: "local".into(),
+                device_id: device_id.into(),
                 workspace_scope: WorkspaceScope::Local,
                 capabilities: Vec::new(),
             },
@@ -513,6 +579,59 @@ impl EngineHandle {
 
     pub fn client(&self) -> &RpcClient {
         self.inner.client()
+    }
+
+    pub(crate) fn with_hub(home: EngineHandle) -> EngineHandle {
+        let hub = EngineHub::new(home.clone());
+        let client = Arc::new(EngineHub::router_client(&hub));
+        EngineHandle {
+            inner: Arc::new(HubEngine {
+                hub,
+                client,
+                mode: home.mode(),
+            }),
+            engine_info: home.engine_info.clone(),
+            deferred_state: home.deferred_state(),
+        }
+    }
+
+    pub(crate) fn hub(&self) -> Option<Arc<EngineHub>> {
+        self.inner.hub()
+    }
+
+    pub fn remote_destination(&self) -> Option<String> {
+        match self.mode() {
+            EngineMode::Ssh { destination } => Some(destination),
+            _ => None,
+        }
+    }
+
+    /// Open an ssh RPC session to a saved SSH target and promote it to an
+    /// engine handle (the remote runs `zeron rpc-stdio`). Must run on the tokio
+    /// runtime. `upload_binary_over_ssh` may push a binary first.
+    pub async fn connect_ssh(
+        target: &zeron_rpc::ssh::SshTarget,
+        edge_url: &str,
+    ) -> anyhow::Result<EngineHandle> {
+        let (client, child) = zeron_rpc::ssh::connect_stdio(target, edge_url)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let client = Arc::new(client);
+        let engine_info = query_engine_info(&client).await.map_err(|err| {
+            anyhow::anyhow!(
+                "{} connected but did not answer EngineInfo: {err}",
+                target.destination()
+            )
+        })?;
+        Ok(EngineHandle {
+            inner: Arc::new(SshEngine {
+                client,
+                destination: target.destination(),
+                child: tokio::sync::Mutex::new(Some(child)),
+            }),
+            engine_info,
+            deferred_state: None,
+        })
     }
 
     pub fn mode(&self) -> EngineMode {
@@ -739,6 +858,12 @@ pub struct AppState {
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
+    /// Edge base URL (release downloads for `upload_binary_over_ssh`); set at
+    /// bootstrap from the engine boot config.
+    pub edge_url: String,
+    /// The single router handle used by every UI surface. It is `None` only
+    /// during bootstrap; once attached it always contains the home engine plus
+    /// any connected SSH engines.
     engine: Option<EngineHandle>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
@@ -813,6 +938,7 @@ impl AppState {
             local_device_id: None,
             update: None,
             data_dir: None,
+            edge_url: String::new(),
             engine: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
@@ -1753,6 +1879,60 @@ impl AppState {
         self.engine = Some(handle);
     }
 
+    /// Add an SSH engine to the router without replacing the home workspace.
+    /// Reopening the standing watches gives newly connected engines an opening
+    /// frame and lets the reducers see the merged projection immediately.
+    pub fn connect_remote_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        let Some(router) = self.engine.clone() else {
+            return;
+        };
+        let Some(hub) = router.hub() else {
+            return;
+        };
+        if let Some(previous) = hub.add_remote(handle) {
+            cx.spawn(async move |_, _| {
+                previous.shutdown().await;
+            })
+            .detach();
+        }
+        self.restart_router_watches(cx, router);
+    }
+
+    /// Remove an SSH engine while leaving the home engine and all other remote
+    /// engines active.
+    pub fn disconnect_remote_engine(&mut self, destination: &str, cx: &mut Context<Self>) {
+        let Some(router) = self.engine.clone() else {
+            return;
+        };
+        let Some(hub) = router.hub() else {
+            return;
+        };
+        let Some(remote) = hub.remove_remote_destination(destination) else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            remote.shutdown().await;
+        })
+        .detach();
+        self.restart_router_watches(cx, router);
+    }
+
+    pub fn is_remote_connected(&self, destination: &str) -> bool {
+        self.engine
+            .as_ref()
+            .and_then(EngineHandle::hub)
+            .is_some_and(|hub| hub.is_connected_destination(destination))
+    }
+
+    fn restart_router_watches(&mut self, cx: &mut Context<Self>, router: EngineHandle) {
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.queue_task = None;
+        self.change_request_tasks.clear();
+        self.change_requests = ChangeRequestClientState::default();
+        self.attach_engine(router, cx);
+    }
+
     /// Drop every account-scoped view and subscription after its runtime has
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
@@ -1801,14 +1981,20 @@ impl AppState {
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
+        let edge_url = config.edge_url.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir);
+            s.edge_url = edge_url;
             cx.notify();
         });
-        let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
+        let boot = Tokio::spawn(cx, async move {
+            EngineHandle::bootstrap(config)
+                .await
+                .map(EngineHandle::with_hub)
+        });
         cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),

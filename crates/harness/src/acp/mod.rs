@@ -60,6 +60,13 @@ use subagent_devin::DevinTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// pi's model probe is not a cheap handshake: `pi-acp` builds its model list
+/// inside `session/new` from pi's own `get_available_models`, which resolves
+/// the live provider catalog (observed ~16-21s for ~200 models). The shared
+/// 10s bound timed out every probe, so `models()` kept falling back to pi's
+/// single-entry static catalog and none of pi's real models reached the
+/// picker. Give the probe the same generous budget as the session handshake.
+const PI_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
     id: HarnessId,
@@ -897,7 +904,7 @@ impl AcpHarness {
     /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
     /// pi's RPC mode.
     pub fn pi() -> Self {
-        Self::with_spec(pi_spec())
+        Self::with_spec(pi_spec()).with_model_discovery_timeout(PI_MODEL_DISCOVERY_TIMEOUT)
     }
 
     /// google antigravity over its acp server (`agy_acp_server`).
@@ -1069,6 +1076,13 @@ impl AcpHarness {
     pub fn with_model_discovery_timeout(mut self, timeout: Duration) -> Self {
         self.model_discovery_timeout = timeout;
         self
+    }
+
+    /// The bound a model probe gets before `models()` falls back to the static
+    /// catalog (test seam).
+    #[doc(hidden)]
+    pub fn model_discovery_timeout(&self) -> Duration {
+        self.model_discovery_timeout
     }
 
     /// Test seam: the program `run` would spawn (the adapter binary, or —
@@ -3818,6 +3832,45 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn tmp_pi_probe() {
+        let harness = AcpHarness::pi();
+        eprintln!("PATH = {:?}", std::env::var_os("PATH"));
+        let (mut child, stderr) = harness.spawn_agent(None, false, &[]).await.unwrap();
+        eprintln!("exe/args resolved");
+        let (client, _incoming) =
+            RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let init = client.request("initialize", initialize_params(HarnessId::Pi)).await;
+        eprintln!("init: {init:?}");
+        let cwd = crate::executable::home_or_current_dir();
+        let session = client
+            .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+            .await;
+        eprintln!("session: {session:?}");
+        eprintln!("pi-acp stderr: {:?}", stderr.snapshot());
+        crate::shutdown_child(&mut child, harness.kill_grace).await;
+    }
+
+    #[test]
+    fn pi_grants_its_slow_model_probe_a_longer_bound_than_the_shared_default() {
+        // pi-acp resolves pi's live provider catalog inside `session/new`,
+        // which runs far past the shared 10s probe bound. Timing out there
+        // dropped the picker back to the single-entry static catalog.
+        let pi = AcpHarness::pi();
+        assert!(
+            pi.model_discovery_timeout() > DEFAULT_MODEL_DISCOVERY_TIMEOUT,
+            "pi model discovery would time out before pi-acp answers: {:?}",
+            pi.model_discovery_timeout()
+        );
+        // The other ACP agents answer the probe promptly and keep the tight
+        // shared bound, so a real hang still fails fast.
+        assert_eq!(
+            AcpHarness::grok().model_discovery_timeout(),
+            DEFAULT_MODEL_DISCOVERY_TIMEOUT
+        );
+    }
 
     fn all_antigravity_auth_methods() -> Value {
         json!({

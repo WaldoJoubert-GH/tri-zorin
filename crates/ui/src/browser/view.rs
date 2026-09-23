@@ -135,7 +135,10 @@ impl BrowserSurface {
             };
             content = content.child(
                 div()
-                    .id(gpui::SharedString::from(format!("preview-row-{}", service.id)))
+                    .id(gpui::SharedString::from(format!(
+                        "preview-row-{}",
+                        service.id
+                    )))
                     .w_full()
                     .h(px(56.0))
                     .px(px(14.0))
@@ -281,7 +284,11 @@ impl BrowserSurface {
         if self.page.url.is_none() && self.previews_task.is_some() {
             return self.preview_body(theme, cx);
         }
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_error = self.page.error.is_some();
         let title = if has_error {
             "Couldn’t load this page"
@@ -293,7 +300,7 @@ impl BrowserSurface {
         let description = if let Some(error) = &self.page.error {
             error.clone()
         } else if external {
-            "Open a website or local app in your default browser. Embedded browsing is available on macOS and Linux.".into()
+            "Open a website or local app in your default browser. Embedded browsing is available on macOS, Linux, and Windows.".into()
         } else {
             "Preview your local app or keep a website beside your conversation.".into()
         };
@@ -400,7 +407,11 @@ impl Render for BrowserSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let focused = self.address.focus_handle(cx).is_focused(window);
-        let external = !cfg!(any(target_os = "macos", target_os = "linux"));
+        let external = !cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        ));
         let has_page = self.page.url.is_some();
         let back = button(
             "browser-back",
@@ -605,7 +616,34 @@ impl Render for BrowserSurface {
         } else {
             body.child(self.empty_body(&theme, cx))
         };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        let body = if let Some(native) = &self.native {
+            if self.page.error.is_some() {
+                body.child(self.empty_body(&theme, cx))
+            } else {
+                let native = std::rc::Rc::downgrade(&native.handle());
+                body.child(
+                    gpui::canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, cx| {
+                            let native = native.clone();
+                            let scale = window.scale_factor();
+                            let dragging = cx.has_active_drag();
+                            window.on_present(move || {
+                                if let Some(native) = native.upgrade() {
+                                    native.borrow_mut().sync(bounds, scale, dragging);
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            }
+        } else {
+            body.child(self.empty_body(&theme, cx))
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let body = body.child(self.empty_body(&theme, cx));
 
         #[cfg(target_os = "linux")]

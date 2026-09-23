@@ -11867,6 +11867,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite",
@@ -11875,6 +11876,7 @@ dependencies = [
  "zeron-doc",
  "zeron-proto",
  "zeron-sync",
+ "zeron-update",
 ]
 
 [[package]]

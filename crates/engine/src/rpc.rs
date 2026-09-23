@@ -1014,12 +1014,24 @@ fn forwardable(method: &str) -> bool {
     )
 }
 
-/// Forwardable methods whose reply is a stream (proxied item-by-item).
-fn is_stream_method(method: &str) -> bool {
+/// RPC methods whose reply is a stream.
+///
+/// This is public because the UI's multi-engine router has the same transport
+/// seam as the engine's relay-forwarding path and must preserve stream replies.
+pub fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
-        methods::WATCH_DOC_MESSAGES
+        methods::AUTH_STATUS
+            | methods::WATCH_PREVIEWS
+            | methods::IMPORT_LOCAL_WORKSPACE
+            | methods::WATCH_DOC_MESSAGES
             | methods::WATCH_QUEUE
+            | methods::WATCH_CONNECTIVITY
+            | methods::WATCH_TRANSFERS
+            | methods::WATCH_CHATS
+            | methods::WATCH_DEVICES
+            | methods::WATCH_SPACES
+            | methods::WATCH_SESSIONS
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST

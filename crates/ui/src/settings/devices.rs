@@ -4,18 +4,20 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, SharedString, Subscription, Task, Window, div,
+    AnyElement, App, ClipboardItem, Context, Entity, SharedString, Subscription, Task, Window, div,
     prelude::*, px,
 };
+use std::collections::HashMap;
 use std::time::Duration;
 
 use zeron_proto::WorkspaceScope;
 use zeron_rpc::methods;
+use zeron_rpc::ssh::{self, SshTarget};
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::popover;
 use crate::settings::widgets;
-use crate::state::AppState;
+use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 /// A device that pinged within this window shows a presence dot (engines
@@ -61,6 +63,18 @@ struct RenameDialog {
     _events: Subscription,
 }
 
+/// Add-SSH-target dialog: one URL field (`ssh://[user@]host[:port]`, Zed
+/// style) plus an optional nickname. Host-key verification, passwords, and
+/// key passphrases stay in the user's own ssh on Test/connect.
+struct SshAddDialog {
+    target_input: Entity<ComposerInput>,
+    nickname_input: Entity<ComposerInput>,
+    /// Upload a matching zeron build over ssh instead of requiring it on the
+    /// remote PATH (`SshTarget::upload_binary_over_ssh`).
+    upload_binary: bool,
+    _events: Vec<Subscription>,
+}
+
 pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
@@ -70,12 +84,25 @@ pub struct DevicesPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    /// Device-local SSH targets (`{data_dir}/ssh-targets.json`).
+    ssh_targets: Vec<SshTarget>,
+    ssh_dialog: Option<SshAddDialog>,
+    ssh_error: Option<SharedString>,
+    /// Per-target last `Test` outcome, keyed by target id.
+    ssh_status: HashMap<String, SharedString>,
+    ssh_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
 impl DevicesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let ssh_targets = state
+            .read(cx)
+            .data_dir
+            .as_deref()
+            .map(ssh::load_targets)
+            .unwrap_or_default();
         Self {
             state,
             scroll: widgets::PageScroll::default(),
@@ -84,8 +111,180 @@ impl DevicesPage {
             error: None,
             task: None,
             copy_task: None,
+            ssh_targets,
+            ssh_dialog: None,
+            ssh_error: None,
+            ssh_status: HashMap::new(),
+            ssh_task: None,
             _observe: observe,
         }
+    }
+
+    fn data_dir(&self, cx: &App) -> Option<std::path::PathBuf> {
+        self.state.read(cx).data_dir.clone()
+    }
+
+    fn reload_ssh_targets(&mut self, cx: &mut Context<Self>) {
+        if let Some(dir) = self.data_dir(cx) {
+            self.ssh_targets = ssh::load_targets(&dir);
+        }
+        cx.notify();
+    }
+
+    fn open_ssh_add(&mut self, cx: &mut Context<Self>) {
+        let target_input = cx.new(|cx| ComposerInput::new("ssh://user@host:port", cx));
+        let nickname_input = cx.new(|cx| ComposerInput::new("Nickname (optional)", cx));
+        let mut events = Vec::with_capacity(2);
+        events.push(
+            cx.subscribe(&target_input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Submitted) {
+                    this.submit_ssh_add(cx);
+                }
+            }),
+        );
+        events.push(
+            cx.subscribe(&nickname_input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Submitted) {
+                    this.submit_ssh_add(cx);
+                }
+            }),
+        );
+        self.ssh_dialog = Some(SshAddDialog {
+            target_input,
+            nickname_input,
+            upload_binary: false,
+            _events: events,
+        });
+        self.ssh_error = None;
+        cx.notify();
+    }
+
+    fn submit_ssh_add(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.ssh_dialog.take() else {
+            return;
+        };
+        let raw = dialog.target_input.read(cx).text().trim().to_string();
+        let nickname = dialog.nickname_input.read(cx).text().trim().to_string();
+        let Some(dir) = self.data_dir(cx) else {
+            self.ssh_error = Some("No data directory — cannot save SSH targets.".into());
+            cx.notify();
+            return;
+        };
+        let mut target = match ssh::parse_ssh_target(&raw) {
+            Ok(target) => target,
+            Err(err) => {
+                // Keep the dialog open and show why the URL was rejected.
+                // (Inputs are fresh — the user retypes; typed secrets are
+                // never persisted anywhere.)
+                self.ssh_dialog = Some(dialog);
+                self.ssh_error = Some(SharedString::from(err));
+                cx.notify();
+                return;
+            }
+        };
+        if !nickname.is_empty() {
+            target.nickname = Some(nickname);
+        }
+        target.upload_binary_over_ssh = dialog.upload_binary;
+        match ssh::upsert_target(&dir, target) {
+            Ok(_) => {
+                self.ssh_error = None;
+                self.reload_ssh_targets(cx);
+            }
+            Err(err) => {
+                self.ssh_error = Some(SharedString::from(format!("Save failed: {err}")));
+                cx.notify();
+            }
+        }
+    }
+
+    fn remove_ssh_target(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(dir) = self.data_dir(cx) else {
+            return;
+        };
+        match ssh::remove_target(&dir, &id) {
+            Ok(_) => {
+                self.ssh_status.remove(&id);
+                self.reload_ssh_targets(cx);
+            }
+            Err(err) => {
+                self.ssh_error = Some(SharedString::from(format!("Remove failed: {err}")));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Add this SSH device to the engine hub. The home workspace remains live
+    /// and the router sends calls for the connected device to this engine.
+    fn connect_ssh_target(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        let id = target.id.clone();
+        let edge_url = self.state.read(cx).edge_url.clone();
+        self.ssh_status.insert(id.clone(), "Connecting…".into());
+        cx.notify();
+        let connect = gpui_tokio::Tokio::spawn(cx, async move {
+            EngineHandle::connect_ssh(&target, &edge_url).await
+        });
+        self.ssh_task = Some(cx.spawn(async move |this, cx| {
+            match connect.await {
+                Ok(Ok(handle)) => {
+                    this.update(cx, |page, cx| {
+                        page.ssh_status.insert(id, "Connected".into());
+                        page.state.update(cx, |state, cx| {
+                            state.connect_remote_engine(handle, cx);
+                        });
+                    })
+                    .ok();
+                }
+                Ok(Err(err)) => {
+                    this.update(cx, |page, cx| {
+                        page.ssh_status
+                            .insert(id, SharedString::from(format!("Connect failed: {err}")));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    this.update(cx, |page, cx| {
+                        page.ssh_status.insert(
+                            id,
+                            SharedString::from(format!("Connect task failed: {err}")),
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
+    fn disconnect_ssh_target(&mut self, destination: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.disconnect_remote_engine(&destination, cx);
+        });
+        cx.notify();
+    }
+
+    fn test_ssh_target(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        let id = target.id.clone();
+        let edge_url = self.state.read(cx).edge_url.clone();
+        self.ssh_status.insert(id.clone(), "Testing…".into());
+        cx.notify();
+        // ssh spawning needs the tokio runtime.
+        let probe = gpui_tokio::Tokio::spawn(cx, async move {
+            ssh::check_target(&target, &edge_url).await
+        });
+        self.ssh_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = match probe.await {
+                Ok(Ok(version)) => SharedString::from(format!("OK — {version}")),
+                Ok(Err(err)) => SharedString::from(err),
+                Err(err) => SharedString::from(format!("test task failed: {err}")),
+            };
+            this.update(cx, |page, cx| {
+                page.ssh_status.insert(id, outcome);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
@@ -195,6 +394,255 @@ impl DevicesPage {
             cx.notify();
         }
     }
+
+    fn render_ssh_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).for_popup();
+        let dialog = self.ssh_dialog.as_ref()?;
+        let target_input = dialog.target_input.clone();
+        let nickname_input = dialog.nickname_input.clone();
+        let error = self.ssh_error.clone();
+        let upload_binary = dialog.upload_binary;
+        let mut card = popover::dialog_card(&theme)
+            .child(popover::dialog_title(&theme, "Add SSH device"))
+            .child(
+                div()
+                    .mt(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(popover::dialog_field(target_input.into_any_element()))
+                    .child(popover::dialog_field(nickname_input.into_any_element()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(widgets::field_label(&theme, "Upload binary over SSH"))
+                                    .child(
+                                        div()
+                                            .text_size(crate::typography::ui_rems(11.0))
+                                            .text_color(theme.text_muted)
+                                            .child(SharedString::from(
+                                                "Copy a matching zeron build to the remote instead of requiring it on PATH.",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                widgets::toggle_switch(&theme, upload_binary)
+                                    .id("ssh-add-upload-toggle")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(dialog) = this.ssh_dialog.as_mut() {
+                                            dialog.upload_binary = !dialog.upload_binary;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+        if let Some(message) = error {
+            card = card.child(
+                div()
+                    .mt(px(8.0))
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .text_color(theme.danger)
+                    .child(message),
+            );
+        }
+        let card = card
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "ssh-add-cancel")
+                            .id("ssh-add-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ssh_dialog = None;
+                                this.ssh_error = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        popover::btn_primary(&theme, "Add")
+                            .id("ssh-add-save")
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_ssh_add(cx))),
+                    ),
+            )
+            .into_any_element();
+        Some(popover::modal("ssh-add-dialog", viewport, card))
+    }
+
+    fn render_ssh_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let targets = self.ssh_targets.clone();
+        let status = self.ssh_status.clone();
+        let active_destinations: std::collections::HashSet<String> = {
+            let state = self.state.read(cx);
+            targets
+                .iter()
+                .filter(|target| state.is_remote_connected(&target.destination()))
+                .map(|target| target.destination())
+                .collect()
+        };
+        let mut rows: Vec<AnyElement> = targets
+            .into_iter()
+            .enumerate()
+            .map(|(ix, target)| {
+                let id = target.id.clone();
+                let remove_id = id.clone();
+                let test_target = target.clone();
+                let connect_target = target.clone();
+                let destination = target.destination();
+                let is_active = active_destinations.contains(&destination);
+                let mut meta: Vec<AnyElement> = vec![
+                    div()
+                        .child(SharedString::from(target.destination()))
+                        .into_any_element(),
+                ];
+                meta.push(
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(10.5))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from(short_id(&target.id)))
+                        .into_any_element(),
+                );
+                if let Some(line) = status.get(&id) {
+                    meta.push(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .child(line.clone())
+                            .into_any_element(),
+                    );
+                }
+                if target.upload_binary_over_ssh {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(SharedString::from("uploads binary"))
+                            .into_any_element(),
+                    );
+                }
+                widgets::card_row(&theme, ix == 0)
+                    .child(widgets::row_tile(&theme, crate::icons::MONITOR))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(&theme, target.display_name()))
+                            .child(widgets::meta_line(&theme, meta)),
+                    )
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id(("ssh-connect", ix))
+                            .opacity(0.7)
+                            .hover(|s| {
+                                s.opacity(1.0)
+                                    .bg(crate::theme::ink(0.06))
+                                    .text_color(theme.text)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if is_active {
+                                    this.disconnect_ssh_target(destination.clone(), cx);
+                                } else {
+                                    this.connect_ssh_target(connect_target.clone(), cx);
+                                }
+                            }))
+                            .child(SharedString::from(if is_active {
+                                "Disconnect"
+                            } else {
+                                "Connect"
+                            })),
+                    )
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id(("ssh-test", ix))
+                            .opacity(0.7)
+                            .hover(|s| {
+                                s.opacity(1.0)
+                                    .bg(crate::theme::ink(0.06))
+                                    .text_color(theme.text)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.test_ssh_target(test_target.clone(), cx);
+                            }))
+                            .child(SharedString::from("Test")),
+                    )
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id(("ssh-remove", ix))
+                            .opacity(0.7)
+                            .hover(|s| {
+                                s.opacity(1.0)
+                                    .bg(crate::theme::ink(0.06))
+                                    .text_color(theme.text)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_ssh_target(remove_id.clone(), cx);
+                            }))
+                            .child(SharedString::from("Remove")),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let card = widgets::section_card(&theme);
+        let card = if rows.is_empty() {
+            card.child(
+                div()
+                    .px(px(20.0))
+                    .py(px(24.0))
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(SharedString::from(
+                        "No SSH devices. Add a box you can ssh into; its engine runs headless and this UI drives it directly — no sync account needed.",
+                    )),
+            )
+        } else {
+            card.children(std::mem::take(&mut rows))
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(widgets::page_subtitle(
+                        &theme,
+                        "SSH devices — direct connections over your own ssh config and keys.",
+                    ))
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id("ssh-add-open")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_ssh_add(cx)))
+                            .child(SharedString::from("Add SSH device")),
+                    ),
+            )
+            .child(card)
+            .into_any_element()
+    }
 }
 
 impl popover::ScrollRailHost for DevicesPage {
@@ -243,6 +691,8 @@ impl Render for DevicesPage {
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let ssh_dialog = self.render_ssh_dialog(window.viewport_size(), cx);
+        let ssh_section = self.render_ssh_section(cx);
         let emerald = theme.success; // emerald-400
         let count = devices.len();
 
@@ -446,11 +896,13 @@ impl Render for DevicesPage {
                                         })),
                                 )
                             })
-                            .child(card),
+                            .child(card)
+                            .child(ssh_section),
                     ),
             )
             .children(scrollbar)
             .when_some(dialog, |el, dialog| el.child(dialog))
+            .when_some(ssh_dialog, |el, dialog| el.child(dialog))
     }
 }
 

@@ -3,10 +3,14 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(target_os = "macos")]
 use macos as native;
+#[cfg(target_os = "windows")]
+use windows as native;
 pub mod model;
 mod view;
 
@@ -70,12 +74,12 @@ pub enum BrowserEvent {
 /// A window/profile's ephemeral website data, allocated on first navigation.
 #[derive(Clone, Default)]
 pub struct BrowserContext {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     data: native::BrowserData,
 }
 
 pub struct BrowserSurface {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     context: BrowserContext,
     address: Entity<ComposerInput>,
     focus: FocusHandle,
@@ -93,11 +97,20 @@ pub struct BrowserSurface {
     #[cfg(target_os = "macos")]
     resize_inset: gpui::Pixels,
     _input_sub: Subscription,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     native: Option<native::NativePage>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// Windows creates its WebView2 page from a spawned task (creation pumps
+    /// the message loop, which is only re-entrancy-safe outside an app borrow),
+    /// so navigation must not start a second creation while one is in flight.
+    #[cfg(target_os = "windows")]
+    native_creating: bool,
+    /// Bumped on every creation start and on close so a late creation result
+    /// cannot attach a page to a tab that has since navigated away or closed.
+    #[cfg(target_os = "windows")]
+    native_generation: u64,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     native_tx: tokio::sync::mpsc::Sender<native::NativeEvent>,
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     _native_task: gpui::Task<()>,
     #[cfg(target_os = "macos")]
     favicon_task: Option<gpui::Task<()>>,
@@ -133,9 +146,9 @@ impl BrowserSurface {
                 cx.notify();
             }
         });
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         let (native_tx, mut events) = tokio::sync::mpsc::channel(64);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         let native_task = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this
@@ -148,10 +161,10 @@ impl BrowserSurface {
                 }
             }
         });
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let _ = (window, context);
         Self {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             context,
             address,
             focus: cx.focus_handle(),
@@ -169,11 +182,15 @@ impl BrowserSurface {
             #[cfg(target_os = "macos")]
             resize_inset: gpui::px(0.0),
             _input_sub: input_sub,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             native: None,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(target_os = "windows")]
+            native_creating: false,
+            #[cfg(target_os = "windows")]
+            native_generation: 0,
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             native_tx,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             _native_task: native_task,
             #[cfg(target_os = "macos")]
             favicon_task: None,
@@ -226,7 +243,7 @@ impl BrowserSurface {
             return;
         }
         self.presentation = presentation;
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if let Some(native) = &mut self.native {
             native.present(presentation);
         }
@@ -341,7 +358,76 @@ impl BrowserSurface {
             }
             window.focus(&self.focus, cx);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(native) = &self.native {
+                let result = native.load(&url);
+                self.page.loading = result.is_ok();
+                if let Err(error) = result {
+                    self.page.error = Some(format!("Could not open this page: {error}"));
+                }
+                window.focus(&self.focus, cx);
+            } else if !self.native_creating {
+                // Creating the WebView2 controller pumps the Windows message
+                // loop. Doing that here would let the pump dispatch GPUI tasks
+                // while this update already holds the app cell, which panics
+                // and aborts. Hand creation to a spawned task: its first poll
+                // runs outside any app borrow, so re-entrant tasks are fine.
+                match native::ParentWindow::from_window(window) {
+                    Ok(parent) => {
+                        self.native_creating = true;
+                        self.native_generation = self.native_generation.wrapping_add(1);
+                        let generation = self.native_generation;
+                        self.page.loading = true;
+                        self.address.update(cx, |input, _| input.stop_caret_blink());
+                        window.focus(&self.focus, cx);
+                        let presentation = self.presentation;
+                        let tx = self.native_tx.clone();
+                        cx.spawn(async move |this, cx| {
+                            let created = {
+                                let _pump_guard = crate::composer::NativeHostPumpGuard::new();
+                                native::NativePage::create(parent, tx)
+                            };
+                            let _ = this.update(cx, |this, cx| {
+                                // Close or a newer navigation superseded us.
+                                if this.native_generation != generation {
+                                    return;
+                                }
+                                this.native_creating = false;
+                                match created {
+                                    Ok(mut native) => {
+                                        native.present(presentation);
+                                        let url = this.page.url.clone().unwrap_or_default();
+                                        let result = native.load(&url);
+                                        this.native = Some(native);
+                                        this.page.loading = result.is_ok();
+                                        if let Err(error) = result {
+                                            this.page.error =
+                                                Some(format!("Could not open this page: {error}"));
+                                        }
+                                    }
+                                    Err(error) => {
+                                        this.page.loading = false;
+                                        this.page.error =
+                                            Some(format!("Could not open this page: {error}"));
+                                    }
+                                }
+                                cx.emit(BrowserEvent::Changed);
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                    Err(error) => {
+                        self.page.loading = false;
+                        self.page.error = Some(format!("Could not open this page: {error}"));
+                    }
+                }
+            }
+            // While a creation task is in flight, `page.url` already holds the
+            // newest address; that task loads it once the page exists.
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = window;
             cx.open_url(&url);
@@ -356,7 +442,7 @@ impl BrowserSurface {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if let Some(native) = &self.native {
             if self.page.error.is_some() {
                 if let Some(url) = &self.page.url {
@@ -367,7 +453,7 @@ impl BrowserSurface {
             }
             self.page.error = None;
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         self.open_external(cx);
         cx.notify();
     }
@@ -384,11 +470,11 @@ impl BrowserSurface {
     }
 
     fn history(&mut self, forward: bool) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if let Some(native) = &self.native {
             native.history(forward);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let _ = forward;
     }
 
@@ -402,7 +488,7 @@ impl BrowserSurface {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.set_presentation(Presentation::Hidden, cx);
         self.clear_favicon(cx);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         {
             if let Some(native) = &mut self.native {
                 native.present(Presentation::Hidden);
@@ -412,6 +498,12 @@ impl BrowserSurface {
                 cx.defer(move |cx| gpui::ImageSource::Render(image).evict(None, cx));
             }
             self.native = None;
+            #[cfg(target_os = "windows")]
+            {
+                // Invalidate any in-flight creation task.
+                self.native_creating = false;
+                self.native_generation = self.native_generation.wrapping_add(1);
+            }
             #[cfg(target_os = "macos")]
             {
                 self.favicon_task = None;
@@ -540,6 +632,45 @@ impl BrowserSurface {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl BrowserSurface {
+    fn on_native_event(
+        &mut self,
+        event: native::NativeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(native) = &mut self.native else {
+            return;
+        };
+        match event {
+            native::NativeEvent::Changed => {
+                let page = native.state();
+                if !self.address.focus_handle(cx).is_focused(window) {
+                    if let Some(url) = &page.url {
+                        if self.address.read(cx).text() != url {
+                            self.address
+                                .update(cx, |input, cx| input.set_text(url.clone(), cx));
+                        }
+                    }
+                    self.address_edited = false;
+                }
+                native.present(self.presentation);
+                if page != self.page {
+                    self.page = page;
+                    cx.emit(BrowserEvent::Changed);
+                }
+                cx.notify();
+            }
+            native::NativeEvent::NewTab(url) => {
+                if self.presentation == Presentation::Live {
+                    cx.emit(BrowserEvent::NewTab(Some(url)));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "browser-fixture")]
 impl BrowserSurface {
     pub fn fixture_history(&mut self, forward: bool) {
@@ -589,7 +720,11 @@ impl BrowserSurface {
             self.presentation != Presentation::Hidden
                 && self.native.as_ref().is_some_and(|n| n.image.is_some())
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            self.presentation != Presentation::Hidden && self.native.is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             false
         }
@@ -619,7 +754,11 @@ impl BrowserSurface {
         if let Some(native) = &self.native {
             native.evaluate(script);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        if let Some(native) = &self.native {
+            native.fixture_eval(script);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         let _ = script;
     }
 }

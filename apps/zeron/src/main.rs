@@ -32,6 +32,17 @@ struct Cli {
 enum Command {
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
+    /// Serve the engine RPC over stdio (the SSH remote end — invoked as
+    /// `ssh <target> zeron rpc-stdio` by [`zeron_rpc::ssh::connect_stdio`]).
+    /// Stdout carries only RPC frames; logs go to stderr and the log file.
+    #[command(name = "rpc-stdio", hide = true)]
+    RpcStdio,
+    /// Add, list, test, and remove SSH device targets
+    /// (`{data_dir}/ssh-targets.json`, device-local like Orca).
+    Ssh {
+        #[command(subcommand)]
+        command: SshCommand,
+    },
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
@@ -54,6 +65,48 @@ enum Command {
     Update {
         #[arg(long)]
         check: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshCommand {
+    /// Add a target (`ssh://[user@]host[:port]` or `[user@]host[:port]`).
+    /// Tests `ssh <target> zeron --version` before saving (skip with `--no-test`).
+    Add {
+        /// Target to add.
+        target: String,
+        /// UI label (defaults to `user@host:port`).
+        #[arg(long)]
+        nickname: Option<String>,
+        /// Override the port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Override the username.
+        #[arg(long)]
+        user: Option<String>,
+        /// `-i` identity file.
+        #[arg(long, value_name = "PATH")]
+        identity_file: Option<String>,
+        /// Save without testing first.
+        #[arg(long)]
+        no_test: bool,
+        /// Upload a matching zeron build over ssh (into `~/.zeron/remote`)
+        /// instead of requiring `zeron` on the remote PATH. Same-OS remotes get
+        /// this exact binary; others get the released build for their OS/arch.
+        #[arg(long)]
+        upload_binary: bool,
+    },
+    /// List saved targets.
+    List,
+    /// Remove a target by id, nickname, or destination.
+    Remove {
+        /// Id, nickname, or `user@host:port`.
+        id: String,
+    },
+    /// Test connectivity and report the remote `zeron --version`.
+    Test {
+        /// Id, nickname, or `user@host:port`.
+        id: String,
     },
 }
 
@@ -127,7 +180,11 @@ fn main() -> anyhow::Result<()> {
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let is_stdio = matches!(&cli.command, Some(Command::RpcStdio));
+    let long_running = matches!(
+        &cli.command,
+        None | Some(Command::Headless) | Some(Command::RpcStdio)
+    );
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -141,10 +198,10 @@ fn main() -> anyhow::Result<()> {
     // the engine logs the exact failure line. One file per launch, previous
     // launch kept as `.old`.
     let log_file = if long_running {
-        let mode = if cli.command.is_some() {
-            "headless"
-        } else {
-            "headed"
+        let mode = match &cli.command {
+            Some(Command::RpcStdio) => "rpc-stdio",
+            Some(_) => "headless",
+            None => "headed",
         };
         open_log_file(mode)
     } else {
@@ -153,9 +210,16 @@ fn main() -> anyhow::Result<()> {
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+        // `rpc-stdio` owns stdout for RPC frames — console logs go to stderr.
+        // (BoxMakeWriter keeps both branches the same layer type.)
+        let console_writer = if is_stdio {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        } else {
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+        };
         let registry = tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer());
+            .with(tracing_subscriber::fmt::layer().with_writer(console_writer));
         match log_file {
             Some(file) => registry
                 .with(
@@ -188,6 +252,35 @@ fn main() -> anyhow::Result<()> {
                 engine.run().await
             })
         }
+        Some(Command::RpcStdio) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(rpc_stdio())
+        }
+        Some(Command::Ssh { command }) => match command {
+            SshCommand::Add {
+                target,
+                nickname,
+                port,
+                user,
+                identity_file,
+                no_test,
+                upload_binary,
+            } => ssh_add(
+                target,
+                nickname,
+                port,
+                user,
+                identity_file,
+                no_test,
+                upload_binary,
+            ),
+            SshCommand::List => ssh_list(),
+            SshCommand::Remove { id } => ssh_remove(id),
+            SshCommand::Test { id } => {
+                let runtime = tokio::runtime::Runtime::new()?;
+                runtime.block_on(ssh_test(id))
+            }
+        },
         Some(Command::Login) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::login(engine_config_from_env()))
@@ -428,6 +521,109 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             chat_line(chat.get("room").filter(|v| !v.is_null()))
         );
     }
+    Ok(())
+}
+
+/// `zeron rpc-stdio`: assemble a local engine core and serve its RPC over
+/// stdio for an SSH client (`ssh <target> zeron rpc-stdio`).
+///
+/// Local-only on purpose for this first cut: the remote owns its own
+/// device id, repos, terminals, and workspace files, and the caller addresses
+/// it directly — no edge account or DeviceRoom relay required. Synced-profile
+/// remotes (shared Loro docs over ssh) are follow-up work.
+async fn rpc_stdio() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    let data_dir = paths::data_dir();
+    let config = engine_config_from_env();
+    let registry = Arc::new(zeron_engine::default_registry());
+    let core =
+        zeron_engine::EngineCore::assemble(&data_dir, registry, config.default_harness, None)
+            .map_err(|e| anyhow::anyhow!("engine assemble failed: {e}"))?;
+    let service = core.rpc_service();
+    zeron_rpc::serve_stdio(service).await;
+    core.shutdown().await;
+    Ok(())
+}
+
+/// Resolve a CLI id-or-destination to a saved target.
+fn find_ssh_target(id: &str) -> anyhow::Result<zeron_rpc::ssh::SshTarget> {
+    let targets = zeron_rpc::ssh::load_targets(&paths::data_dir());
+    targets
+        .into_iter()
+        .find(|t| t.id == id || t.display_name() == id || t.destination() == id)
+        .ok_or_else(|| anyhow::anyhow!("no SSH target {id:?} — see `zeron ssh list`"))
+}
+
+fn ssh_add(
+    target: String,
+    nickname: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    identity_file: Option<String>,
+    no_test: bool,
+    upload_binary: bool,
+) -> anyhow::Result<()> {
+    let mut parsed =
+        zeron_rpc::ssh::parse_ssh_target(&target).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(port) = port {
+        if port == 0 {
+            anyhow::bail!("invalid port 0");
+        }
+        parsed.port = port;
+    }
+    if let Some(user) = user.filter(|u| !u.trim().is_empty()) {
+        parsed.username = Some(user);
+    }
+    if let Some(key) = identity_file.filter(|k| !k.trim().is_empty()) {
+        parsed.identity_file = Some(key);
+    }
+    if let Some(name) = nickname.filter(|n| !n.trim().is_empty()) {
+        parsed.nickname = Some(name);
+    }
+    parsed.upload_binary_over_ssh = upload_binary;
+    if !no_test {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let version = runtime
+            .block_on(zeron_rpc::ssh::check_target(&parsed, &edge_url_from_env()))
+            .map_err(|e| anyhow::anyhow!("SSH check failed: {e}"))?;
+        println!("Remote OK: {version}");
+    }
+    let saved = zeron_rpc::ssh::upsert_target(&paths::data_dir(), parsed.clone())?;
+    let _ = saved;
+    println!("Added {} ({})", parsed.display_name(), parsed.id);
+    Ok(())
+}
+
+fn ssh_list() -> anyhow::Result<()> {
+    let targets = zeron_rpc::ssh::load_targets(&paths::data_dir());
+    if targets.is_empty() {
+        println!("No SSH targets. Add one: zeron ssh add ssh://user@host");
+        return Ok(());
+    }
+    for t in targets {
+        let upload = if t.upload_binary_over_ssh {
+            "\tupload"
+        } else {
+            ""
+        };
+        println!("{}\t{}\t{}{}", t.id, t.display_name(), t.destination(), upload);
+    }
+    Ok(())
+}
+
+fn ssh_remove(id: String) -> anyhow::Result<()> {
+    let target = find_ssh_target(&id)?;
+    zeron_rpc::ssh::remove_target(&paths::data_dir(), &target.id)?;
+    println!("Removed {} ({})", target.display_name(), target.id);
+    Ok(())
+}
+
+async fn ssh_test(id: String) -> anyhow::Result<()> {
+    let target = find_ssh_target(&id)?;
+    let version = zeron_rpc::ssh::check_target(&target, &edge_url_from_env())
+        .await
+        .map_err(|e| anyhow::anyhow!("SSH check failed: {e}"))?;
+    println!("{}: {version}", target.display_name());
     Ok(())
 }
 
