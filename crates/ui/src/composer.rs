@@ -3907,6 +3907,9 @@ pub enum ComposerEvent {
     /// yet: the transcript remembers the stable id and promotes it to an
     /// own-turn anchor only when the host materializes the matching bubble.
     Queued { chat_id: String, message_id: String },
+    /// An in-progress Plane pill was clicked: reveal that work item (or, for
+    /// the overflow pill, just the list) in the Plane surface.
+    OpenPlaneItem { item_id: Option<String>, link: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4121,6 +4124,8 @@ pub struct Composer {
     pub(crate) queue_scroll: gpui::ScrollHandle,
     pub(crate) queue_full_preview: Option<Task<()>>,
     pub(crate) queue_previews: HashMap<(String, String), crate::queue::QueuePreview>,
+    /// Source of the in-progress Plane pills stacked above the composer.
+    plane: Option<(Entity<crate::plane::PlaneStore>, gpui::Subscription)>,
     /// Rows awaiting a host-authoritative removal acknowledgement. They stay
     /// visible but inert until the host wins the race against queue delivery.
     pub(crate) queue_removing: HashSet<String>,
@@ -4190,6 +4195,72 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    pub(crate) fn set_plane_store(
+        &mut self,
+        store: Entity<crate::plane::PlaneStore>,
+        cx: &mut Context<Self>,
+    ) {
+        let sub = cx.observe(&store, |_, _, cx| cx.notify());
+        self.plane = Some((store, sub));
+        cx.notify();
+    }
+
+    /// The in-progress Plane work items of the session's linked project, as
+    /// a wrapping row of pills. `None` when Plane is off, unlinked, or idle.
+    fn render_plane_pills(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let store = self.plane.as_ref()?.0.clone();
+        let (link, items) = crate::plane_view::in_progress_items(&store, &self.state, cx)?;
+        let theme = Theme::of(cx).clone();
+        let overflow = items.len().saturating_sub(crate::plane_view::MAX_PILLS);
+        let mut row = div()
+            .mx(px(4.0))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(6.0));
+        for (ix, item) in items
+            .into_iter()
+            .take(crate::plane_view::MAX_PILLS)
+            .enumerate()
+        {
+            let item_id = item.id.clone();
+            let item_link = item.link.clone();
+            row = row.child(
+                crate::plane_view::pill(
+                    &theme,
+                    ("plane-pill", ix),
+                    Some(item.state_color),
+                    Some(item.key(&link.identifier)),
+                    item.title.clone(),
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(ComposerEvent::OpenPlaneItem {
+                        item_id: Some(item_id.clone()),
+                        link: Some(item_link.clone()),
+                    });
+                })),
+            );
+        }
+        if overflow > 0 {
+            row = row.child(
+                crate::plane_view::pill(
+                    &theme,
+                    "plane-pill-more",
+                    None,
+                    None,
+                    format!("+{overflow} in progress").into(),
+                )
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(ComposerEvent::OpenPlaneItem {
+                        item_id: None,
+                        link: None,
+                    });
+                })),
+            );
+        }
+        Some(row)
+    }
+
     pub(crate) fn set_dock_frame(
         &mut self,
         frame: crate::composer_dock::DockFrame,
@@ -4355,6 +4426,7 @@ impl Composer {
             queue_scroll: gpui::ScrollHandle::new(),
             queue_full_preview: None,
             queue_previews: HashMap::new(),
+            plane: None,
             queue_removing: HashSet::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
@@ -7397,6 +7469,12 @@ impl Render for Composer {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
+
+        // In-progress Plane work for this project, above the queue tray (which
+        // tucks under the composer and so must stay its direct neighbour).
+        let container = container.when_some(self.render_plane_pills(cx), |el, pills| {
+            el.child(motion::fade_quick("composer-plane-pills", pills))
+        });
 
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
