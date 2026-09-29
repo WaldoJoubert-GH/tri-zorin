@@ -799,8 +799,11 @@ pub enum SidebarOrganization {
     /// project selector and is normalized to [`Self::InOneList`] on load.
     ByProject,
     ByDevice,
-    #[default]
     InOneList,
+    /// Orca-style tree: each project expands into its worktrees, and each
+    /// worktree lists the sessions running in it.
+    #[default]
+    ByWorktree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1054,7 +1057,7 @@ impl Default for UiSettings {
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
-            sidebar_organization: SidebarOrganization::InOneList,
+            sidebar_organization: SidebarOrganization::ByWorktree,
             sidebar_sort: SidebarSort::LastUpdated,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
