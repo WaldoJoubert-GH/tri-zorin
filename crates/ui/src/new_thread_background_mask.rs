@@ -56,6 +56,26 @@ pub(crate) fn paint(
     cutout: bool,
     window: &mut Window,
 ) {
+    paint_cover(source, bounds, Some(mask(bounds, composer, cutout)), window);
+}
+
+/// The artwork behind an open chat: the same object-fit crop as the hero, but
+/// covering the whole column with no composer cutout or bottom fade — the
+/// transcript scrolls over it everywhere, so it stays uniform.
+pub(crate) fn paint_unmasked(
+    source: Arc<RenderImage>,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    paint_cover(source, bounds, None, window);
+}
+
+fn paint_cover(
+    source: Arc<RenderImage>,
+    bounds: Bounds<Pixels>,
+    alpha_mask: Option<ImageAlphaMask>,
+    window: &mut Window,
+) {
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
     let source_size = source.size(0);
@@ -78,7 +98,7 @@ pub(crate) fn paint(
         source,
         0,
         false,
-        Some(mask(bounds, composer, cutout)),
+        alpha_mask,
     );
 }
 

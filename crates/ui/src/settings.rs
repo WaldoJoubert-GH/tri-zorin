@@ -106,6 +106,51 @@ impl NewThreadBackgroundEffect {
     }
 }
 
+/// How much of the project's background artwork stays visible behind an open
+/// chat. The new-thread canvas always shows it in full; inside a thread the
+/// transcript sits over it, so the artwork is kept faint enough to read over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatBackgroundVisibility {
+    Off,
+    #[default]
+    Subtle,
+    Medium,
+    Strong,
+}
+
+impl ChatBackgroundVisibility {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Subtle, Self::Medium, Self::Strong];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Subtle => "Subtle",
+            Self::Medium => "Medium",
+            Self::Strong => "Strong",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Off => "Chats use the plain canvas.",
+            Self::Subtle => "A faint trace of the artwork stays behind chats.",
+            Self::Medium => "The artwork stays clearly visible behind chats.",
+            Self::Strong => "Chats sit over a bold view of the artwork.",
+        }
+    }
+
+    /// Artwork opacity behind an open chat.
+    pub const fn opacity(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::Subtle => 0.14,
+            Self::Medium => 0.28,
+            Self::Strong => 0.45,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GitHistoryColumns {
@@ -391,6 +436,14 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
 pub fn set_new_thread_background_effect(effect: NewThreadBackgroundEffect, cx: &mut App) {
     if update(SavePolicy::Immediate, cx, |settings| {
         settings.new_thread_background_effect = effect;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_chat_background(visibility: ChatBackgroundVisibility, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.chat_background = visibility;
     }) {
         cx.refresh_windows();
     }
@@ -924,6 +977,9 @@ pub struct UiSettings {
     /// [`NewThreadBackgroundEffect::None`]) = explicit choice for that project.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub space_background_effects: std::collections::HashMap<String, NewThreadBackgroundEffect>,
+    /// Whether (and how strongly) the project's background stays visible
+    /// behind an open chat, rather than dissolving once the thread docks.
+    pub chat_background: ChatBackgroundVisibility,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -990,6 +1046,7 @@ impl Default for UiSettings {
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             space_backgrounds: std::collections::HashMap::new(),
             space_background_effects: std::collections::HashMap::new(),
+            chat_background: ChatBackgroundVisibility::default(),
             legacy_accent_color: None,
         }
     }
@@ -2282,11 +2339,13 @@ mod tests {
                 "space-1".to_string(),
                 NewThreadBackgroundEffect::Dither,
             )]),
+            chat_background: ChatBackgroundVisibility::Strong,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
+        assert!(json.contains(r#""chatBackground": "strong""#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));

@@ -951,6 +951,46 @@ fn new_thread_background(
         .into_any_element()
 }
 
+/// The project's artwork kept behind an open chat (Appearance → Background in
+/// chats). It covers the whole conversation column, under the transcript and
+/// the glass chrome, and fades in as the new-thread hero dissolves.
+fn chat_background(
+    artwork: Option<std::sync::Arc<gpui::RenderImage>>,
+    width: f32,
+    height: f32,
+    opacity: f32,
+) -> Option<AnyElement> {
+    let artwork = artwork?;
+    if opacity <= 0.0 {
+        return None;
+    }
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .opacity(opacity.min(1.0))
+            .child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _cx| {
+                        crate::new_thread_background_mask::paint_unmasked(
+                            artwork.clone(),
+                            bounds,
+                            window,
+                        );
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplashPhase {
     Visible,
@@ -3559,6 +3599,7 @@ impl Shell {
         self.settings.new_thread_background_effect = current.new_thread_background_effect;
         self.settings.space_backgrounds = current.space_backgrounds;
         self.settings.space_background_effects = current.space_background_effects;
+        self.settings.chat_background = current.chat_background;
         self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
         self.settings.ui_font_family = current.ui_font_family;
         self.settings.ui_font_size = current.ui_font_size;
@@ -7464,6 +7505,21 @@ impl Shell {
             composer.set_available_width(composer_width, cx)
         });
         let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+        // In a thread the hero is gone; the same artwork may stay behind the
+        // transcript at the chosen strength, crossfading with the hero's
+        // dissolve so docking never pops.
+        let chat_background_layer = chat_background(
+            artwork.clone(),
+            (self.viewport_width - self.sidebar_now()).max(0.0),
+            self.viewport_height,
+            dock_frame.dissolve()
+                * ui_settings.chat_background.opacity()
+                * artwork_opacity
+                * new_thread_background_opacity(theme.is_frost()),
+        );
+        if chat_background_layer.is_some() && has_selection && artwork_opacity < 1.0 {
+            window.request_animation_frame();
+        }
         let new_thread_background_layer = (!has_selection || dock_frame.active).then(|| {
             if artwork.is_some() && artwork_opacity < 1.0 {
                 window.request_animation_frame();
@@ -7604,6 +7660,7 @@ impl Shell {
             // The hero is deliberately outside the transcript EdgeFade below:
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
+            .children(chat_background_layer)
             .children(new_thread_background_layer)
             .child(
                 // Full-height underlay: the transcript viewport spans the
@@ -10325,6 +10382,19 @@ mod tests {
         assert_eq!(new_thread_background_height(1_000.0), 720.0);
         assert_eq!(new_thread_background_height(1_200.0), 760.0);
         assert!(new_thread_background_height(848.0) > 848.0 / 2.0);
+    }
+
+    #[test]
+    fn chat_background_is_skipped_when_off_or_without_artwork() {
+        use settings::ChatBackgroundVisibility as V;
+        assert!(chat_background(None, 800.0, 600.0, 0.5).is_none());
+        assert_eq!(V::Off.opacity(), 0.0);
+        assert_eq!(V::default(), V::Subtle);
+        // Stronger settings reveal more artwork, but never the hero's full
+        // strength — the transcript must stay legible over it.
+        let ladder = V::ALL.map(V::opacity);
+        assert!(ladder.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(ladder.iter().all(|opacity| *opacity < 0.5));
     }
 
     #[test]

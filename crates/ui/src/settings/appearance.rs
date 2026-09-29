@@ -1297,11 +1297,38 @@ fn background_effect_choice(
     effect: crate::settings::NewThreadBackgroundEffect,
     selected: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(SharedString::from(format!(
+    background_choice(
+        theme,
+        format!(
             "new-thread-background-effect-{}",
             effect.label().to_lowercase()
-        )))
+        ),
+        effect.label(),
+        selected,
+    )
+}
+
+fn chat_background_choice(
+    theme: &Theme,
+    visibility: crate::settings::ChatBackgroundVisibility,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    background_choice(
+        theme,
+        format!("chat-background-{}", visibility.label().to_lowercase()),
+        visibility.label(),
+        selected,
+    )
+}
+
+fn background_choice(
+    theme: &Theme,
+    id: String,
+    label: &'static str,
+    selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id))
         .h(px(28.0))
         .px(px(9.0))
         .rounded(px(7.0))
@@ -1329,7 +1356,7 @@ fn background_effect_choice(
         .when(!selected, |control| {
             control.hover(|style| style.bg(theme.surface_raised_hover))
         })
-        .child(effect.label())
+        .child(label)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3262,6 +3289,58 @@ impl Render for AppearancePage {
                             .justify_end()
                             .gap(px(6.0))
                             .children(effect_controls),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // Applies to project artwork too, so offer it whenever any exists.
+        let any_project_background = ui_settings
+            .space_backgrounds
+            .values()
+            .any(|background| background.is_some());
+        if background_available || any_project_background {
+            let current_chat_background = ui_settings.chat_background;
+            let chat_controls = crate::settings::ChatBackgroundVisibility::ALL
+                .into_iter()
+                .map(|visibility| {
+                    chat_background_choice(
+                        &theme,
+                        visibility,
+                        visibility == current_chat_background,
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::settings::set_chat_background(visibility, cx);
+                        cx.notify();
+                    }))
+                })
+                .collect::<Vec<_>>();
+            settings_rows.push(
+                widgets::card_row(&theme, false)
+                    .child(widgets::row_tile(&theme, icons::CHAT_ROUND_LINE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(widgets::row_title(&theme, "Background in chats"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child(current_chat_background.description())
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .ml(px(10.0))
+                            .max_w(px(430.0))
+                            .flex()
+                            .flex_wrap()
+                            .justify_end()
+                            .gap(px(6.0))
+                            .children(chat_controls),
                     )
                     .into_any_element(),
             );
