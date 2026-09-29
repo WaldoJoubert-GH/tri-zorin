@@ -1,6 +1,6 @@
-//! Settings → Plane: the Plane.so API key and workspace slug, plus the list of
-//! Zeron projects linked to Plane projects (linking itself happens in the
-//! Plane right-pane surface).
+//! Settings → Plane: the Plane.so API key and a default workspace slug, plus
+//! the list of Zeron projects linked to Plane projects — each in its own
+//! workspace (linking itself happens in the Plane right-pane surface).
 //!
 //! Writes go straight to the central settings store — the Shell re-reads the
 //! `plane` block in `sync_independent_settings`, so there is no page event.
@@ -44,7 +44,7 @@ impl PlaneSettingsPage {
         let current = settings::plane(cx);
         let key_input = cx.new(|cx| ComposerInput::new("Plane API key", cx).with_single_line());
         let slug_input = cx.new(|cx| {
-            let mut input = ComposerInput::new("Workspace slug (app.plane.so/<slug>)", cx)
+            let mut input = ComposerInput::new("Prefilled when linking a project", cx)
                 .with_single_line();
             input.set_text(current.workspace_slug.clone(), cx);
             input
@@ -177,7 +177,7 @@ impl Render for PlaneSettingsPage {
                         .flex()
                         .flex_col()
                         .gap(px(6.0))
-                        .child(widgets::field_label(&theme, "Workspace slug"))
+                        .child(widgets::field_label(&theme, "Default workspace slug (optional)"))
                         .child(popover::dialog_field(
                             self.slug_input.clone().into_any_element(),
                         )),
@@ -209,13 +209,13 @@ impl Render for PlaneSettingsPage {
             let state = self.state.read(cx);
             plane
                 .projects
-                .iter()
-                .map(|(space_id, link)| {
+                .keys()
+                .filter_map(|space_id| {
                     let name = state
                         .space_row(space_id)
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "Removed project".into());
-                    (space_id.clone(), name, link.clone())
+                    Some((space_id.clone(), name, plane.link(space_id)?))
                 })
                 .collect()
         };
@@ -238,8 +238,14 @@ impl Render for PlaneSettingsPage {
                                     vec![
                                         div()
                                             .child(SharedString::from(format!(
-                                                "{} · {}",
-                                                link.identifier, link.name
+                                                "{} · {} · {}",
+                                                if link.workspace_slug.is_empty() {
+                                                    "no workspace"
+                                                } else {
+                                                    link.workspace_slug.as_str()
+                                                },
+                                                link.identifier,
+                                                link.name
                                             )))
                                             .into_any_element(),
                                     ],
@@ -277,9 +283,11 @@ impl Render for PlaneSettingsPage {
                                 widgets::page_subtitle(
                                     &theme,
                                     "Connect Plane.so to see a project's work items in the Plane \
-                                     tab, with in-progress items pinned above the composer. \
-                                     Create an API key under Profile settings → Personal access \
-                                     tokens. It stays on this device.",
+                                     tab, with In Progress items pinned above the composer. One \
+                                     API key covers all your workspaces; each project picks its \
+                                     own workspace when you link it in the Plane tab. Create a key \
+                                     under Profile settings → Personal access tokens. It stays on \
+                                     this device.",
                                 )
                                 .max_w(px(512.0))
                                 .line_height(px(20.0)),

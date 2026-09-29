@@ -650,11 +650,14 @@ impl Default for GitHistoryColumns {
 
 /// Plane.so credentials plus which Plane project each Zeron project (space)
 /// tracks. Device-local: the API key is stored in `ui-settings.json` on this
-/// machine only.
+/// machine only. One personal access token reaches every workspace its owner
+/// belongs to, so the key is global while each link names its own workspace.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PlaneSettings {
     pub api_key: String,
+    /// Default workspace offered when linking a project. Links made before
+    /// per-project workspaces existed fall back to it.
     pub workspace_slug: String,
     /// Space id → linked Plane project.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -666,15 +669,26 @@ impl PlaneSettings {
         self.api_key.is_empty() && self.workspace_slug.is_empty() && self.projects.is_empty()
     }
 
-    /// Both halves of the connection are present.
     pub fn is_connected(&self) -> bool {
-        !self.api_key.trim().is_empty() && !self.workspace_slug.trim().is_empty()
+        !self.api_key.trim().is_empty()
+    }
+
+    /// The link for `space_id` with its workspace resolved (legacy links
+    /// inherit [`Self::workspace_slug`]).
+    pub fn link(&self, space_id: &str) -> Option<PlaneProjectLink> {
+        let mut link = self.projects.get(space_id)?.clone();
+        if link.workspace_slug.is_empty() {
+            link.workspace_slug = self.workspace_slug.trim().to_owned();
+        }
+        Some(link)
     }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PlaneProjectLink {
+    /// Workspace the project lives in (`app.plane.so/<slug>`).
+    pub workspace_slug: String,
     pub id: String,
     /// Short work-item prefix (`WEB` in `WEB-42`).
     pub identifier: String,
@@ -2336,6 +2350,7 @@ mod tests {
                 projects: std::collections::HashMap::from([(
                     "space-1".to_string(),
                     PlaneProjectLink {
+                        workspace_slug: "acme-web".into(),
                         id: "p-1".into(),
                         identifier: "WEB".into(),
                         name: "Website".into(),

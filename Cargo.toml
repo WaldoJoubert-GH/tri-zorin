@@ -143,6 +143,7 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 0
+debug = false
 
 # Temporary renderer override for the companion per-pixel text fade PR.
 # Replace with an upstream revision once it merges.

@@ -3,10 +3,12 @@
 //! pills.
 //!
 //! Ported from pi-todos' `plane.ts`: the same REST endpoints (`/states/` plus
-//! `/issues/` per project, `X-API-Key` auth), the same five-minute background
-//! sync, and the same priority → state-group → title ordering. Unlike pi-todos
-//! (one project per repo via `.dev/config.json`), each Zeron project (space)
-//! links to its own Plane project through [`PlaneSettings::projects`].
+//! `/issues/` per project, `PATCH /issues/{id}/` to move state, `X-API-Key`
+//! auth), the same five-minute background sync, the same priority →
+//! state-group → title ordering, and the same "In Progress" state-name test
+//! for the pills. Unlike pi-todos (one project per repo via
+//! `.dev/config.json`), each Zeron project (space) links to its own Plane
+//! workspace + project through [`PlaneSettings::projects`].
 //!
 //! [`PlaneSettings::projects`]: crate::settings::PlaneSettings
 
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 use gpui::{App, Context, Hsla, SharedString, Task};
 use serde::Deserialize;
 
-use crate::settings::{self, PlaneProjectLink, PlaneSettings};
+use crate::settings::{self, PlaneProjectLink};
 use crate::state::AppState;
 
 const API_BASE: &str = "https://api.plane.so/api/v1";
@@ -26,6 +28,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PAGE_SIZE: usize = 100;
 /// Hard stop for runaway pagination (2 000 work items per project).
 const MAX_PAGES: usize = 20;
+/// The state name pi-todos pins as "in progress" (`widget.ts`).
+const IN_PROGRESS_STATE: &str = "In Progress";
 
 // ---------------------------------------------------------------------------
 // Model
@@ -73,7 +77,7 @@ impl StateGroup {
         !matches!(self, Self::Completed | Self::Cancelled)
     }
 
-    fn sort_key(self) -> usize {
+    pub fn sort_key(self) -> usize {
         Self::DISPLAY_ORDER
             .iter()
             .position(|g| *g == self)
@@ -112,11 +116,23 @@ impl Priority {
     }
 }
 
+/// One of a project's workflow states.
+#[derive(Debug, Clone)]
+pub struct PlaneState {
+    pub id: String,
+    pub name: SharedString,
+    pub group: StateGroup,
+    pub color: Hsla,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkItem {
     pub id: String,
     pub sequence_id: Option<u64>,
     pub title: SharedString,
+    /// Plain text, paragraphs separated by newlines.
+    pub description: SharedString,
+    pub state_id: Option<String>,
     pub state_name: SharedString,
     pub state_group: StateGroup,
     pub state_color: Hsla,
@@ -134,8 +150,17 @@ impl WorkItem {
         }
     }
 
+    /// The composer-pill test, as pi-todos draws its widget: the state is
+    /// literally named "In Progress" (not merely in the `started` group).
     pub fn in_progress(&self) -> bool {
-        self.state_group == StateGroup::Started
+        self.state_name.trim().eq_ignore_ascii_case(IN_PROGRESS_STATE)
+    }
+
+    fn apply_state(&mut self, state: &PlaneState) {
+        self.state_id = Some(state.id.clone());
+        self.state_name = state.name.clone();
+        self.state_group = state.group;
+        self.state_color = state.color;
     }
 }
 
@@ -148,12 +173,13 @@ pub struct PlaneProject {
     pub identifier: String,
 }
 
-impl From<&PlaneProject> for PlaneProjectLink {
-    fn from(project: &PlaneProject) -> Self {
-        Self {
-            id: project.id.clone(),
-            identifier: project.identifier.clone(),
-            name: project.name.clone(),
+impl PlaneProject {
+    pub fn link(&self, workspace_slug: &str) -> PlaneProjectLink {
+        PlaneProjectLink {
+            workspace_slug: workspace_slug.to_owned(),
+            id: self.id.clone(),
+            identifier: self.identifier.clone(),
+            name: self.name.clone(),
         }
     }
 }
@@ -172,13 +198,16 @@ pub fn active_space_id(state: &AppState) -> Option<String> {
     }
 }
 
-/// The Plane project linked to `space_id`, when Plane is connected.
+/// The Plane project linked to `space_id`, when Plane is connected and the
+/// link names a workspace.
 pub fn linked_project(space_id: Option<&str>, cx: &App) -> Option<PlaneProjectLink> {
     let plane = settings::plane(cx);
     if !plane.is_connected() {
         return None;
     }
-    plane.projects.get(space_id?).cloned()
+    plane
+        .link(space_id?)
+        .filter(|link| !link.workspace_slug.is_empty())
 }
 
 pub fn link_project(space_id: &str, project: PlaneProjectLink, cx: &mut App) {
@@ -193,6 +222,12 @@ pub fn unlink_project(space_id: &str, cx: &mut App) {
     });
 }
 
+/// Cache key for a linked project: the same project id never collides across
+/// workspaces.
+fn cache_key(link: &PlaneProjectLink) -> String {
+    format!("{}/{}", link.workspace_slug, link.id)
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -200,14 +235,27 @@ pub fn unlink_project(space_id: &str, cx: &mut App) {
 #[derive(Default)]
 pub struct ProjectItems {
     pub items: Vec<WorkItem>,
+    /// Workflow states in display order (group, then name).
+    pub states: Vec<PlaneState>,
     pub fetched_at: Option<Instant>,
     pub error: Option<SharedString>,
+    link: PlaneProjectLink,
     task: Option<Task<()>>,
+    /// In-flight state changes by work item id.
+    updates: HashMap<String, Task<()>>,
 }
 
 impl ProjectItems {
     pub fn loading(&self) -> bool {
         self.task.is_some()
+    }
+
+    pub fn updating(&self, item_id: &str) -> bool {
+        self.updates.contains_key(item_id)
+    }
+
+    pub fn item(&self, item_id: &str) -> Option<&WorkItem> {
+        self.items.iter().find(|i| i.id == item_id)
     }
 }
 
@@ -221,13 +269,14 @@ pub enum WorkspaceProjects {
 }
 
 /// Shared Plane cache: one per window, read by the Plane surface and the
-/// composer pills. Keyed by Plane project id, so two Zeron projects linked to
-/// the same Plane project share one fetch.
+/// composer pills. Keyed by workspace + Plane project, so two Zeron projects
+/// linked to the same Plane project share one fetch.
 pub struct PlaneStore {
     projects: HashMap<String, ProjectItems>,
-    workspace_projects: WorkspaceProjects,
-    /// Credentials the cache was fetched with — a change drops everything.
-    credentials: (String, String),
+    /// Project lists per workspace slug, for linking.
+    workspace_projects: HashMap<String, WorkspaceProjects>,
+    /// API key the cache was fetched with — a change drops everything.
+    api_key: String,
     _refresh: Task<()>,
 }
 
@@ -237,9 +286,10 @@ impl PlaneStore {
             loop {
                 cx.background_executor().timer(REFRESH_INTERVAL).await;
                 let alive = this.update(cx, |store: &mut PlaneStore, cx| {
-                    let ids: Vec<String> = store.projects.keys().cloned().collect();
-                    for id in ids {
-                        store.refresh(&id, cx);
+                    let links: Vec<PlaneProjectLink> =
+                        store.projects.values().map(|p| p.link.clone()).collect();
+                    for link in links {
+                        store.refresh(&link, cx);
                     }
                 });
                 if alive.is_err() {
@@ -249,64 +299,73 @@ impl PlaneStore {
         });
         Self {
             projects: HashMap::new(),
-            workspace_projects: WorkspaceProjects::NotLoaded,
-            credentials: Default::default(),
+            workspace_projects: HashMap::new(),
+            api_key: String::new(),
             _refresh: refresh,
         }
     }
 
-    /// Current credentials, clearing the cache when they changed since the
-    /// last fetch. `None` while Plane is not connected.
-    fn credentials(&mut self, cx: &App) -> Option<(String, String)> {
-        let PlaneSettings {
-            api_key,
-            workspace_slug,
-            ..
-        } = settings::plane(cx);
-        let current = (api_key.trim().to_owned(), workspace_slug.trim().to_owned());
-        if current != self.credentials {
+    /// The current API key, clearing the cache when it changed since the last
+    /// fetch. `None` while Plane is not connected.
+    fn api_key(&mut self, cx: &App) -> Option<String> {
+        let current = settings::plane(cx).api_key.trim().to_owned();
+        if current != self.api_key {
             self.projects.clear();
-            self.workspace_projects = WorkspaceProjects::NotLoaded;
-            self.credentials = current.clone();
+            self.workspace_projects.clear();
+            self.api_key = current.clone();
         }
-        (!current.0.is_empty() && !current.1.is_empty()).then_some(current)
+        (!current.is_empty()).then_some(current)
     }
 
-    pub fn items(&self, project_id: &str) -> Option<&ProjectItems> {
-        self.projects.get(project_id)
+    pub fn items(&self, link: &PlaneProjectLink) -> Option<&ProjectItems> {
+        self.projects.get(&cache_key(link))
     }
 
-    /// Fetch `project_id` once; later calls are free until the next refresh.
-    pub fn ensure(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let _ = self.credentials(cx);
-        if !self.projects.contains_key(project_id) {
-            self.refresh(project_id, cx);
+    /// Fetch `link` once; later calls are free until the next refresh.
+    pub fn ensure(&mut self, link: &PlaneProjectLink, cx: &mut Context<Self>) {
+        let _ = self.api_key(cx);
+        if !self.projects.contains_key(&cache_key(link)) {
+            self.refresh(link, cx);
         }
     }
 
-    pub fn refresh(&mut self, project_id: &str, cx: &mut Context<Self>) {
-        let Some((key, slug)) = self.credentials(cx) else {
+    pub fn refresh(&mut self, link: &PlaneProjectLink, cx: &mut Context<Self>) {
+        let Some(key) = self.api_key(cx) else {
             return;
         };
-        let entry = self.projects.entry(project_id.to_owned()).or_default();
+        let cache = cache_key(link);
+        let entry = self.projects.entry(cache.clone()).or_default();
+        entry.link = link.clone();
         if entry.task.is_some() {
             return;
         }
-        let id = project_id.to_owned();
-        let fetch = gpui_tokio::Tokio::spawn(cx, fetch_work_items(key, slug, id.clone()));
+        let fetch = gpui_tokio::Tokio::spawn(
+            cx,
+            fetch_work_items(key, link.workspace_slug.clone(), link.id.clone()),
+        );
         entry.task = Some(cx.spawn(async move |this, cx| {
             let result = match fetch.await {
                 Ok(result) => result,
                 Err(err) => Err(err.to_string()),
             };
             let _ = this.update(cx, |store: &mut PlaneStore, cx| {
-                let Some(entry) = store.projects.get_mut(&id) else {
+                let Some(entry) = store.projects.get_mut(&cache) else {
                     return;
                 };
                 entry.task = None;
                 match result {
-                    Ok(items) => {
+                    Ok((mut items, states)) => {
+                        // A state change still in flight wins over the
+                        // snapshot fetched before it landed.
+                        for item in &mut items {
+                            if entry.updates.contains_key(&item.id)
+                                && let Some(pending) = entry.item(&item.id)
+                            {
+                                *item = pending.clone();
+                            }
+                        }
                         entry.items = items;
+                        entry.states = states;
                         entry.fetched_at = Some(Instant::now());
                         entry.error = None;
                     }
@@ -318,38 +377,110 @@ impl PlaneStore {
         cx.notify();
     }
 
-    pub fn workspace_projects(&self) -> &WorkspaceProjects {
-        &self.workspace_projects
-    }
-
-    /// Load the workspace's project list (for linking) unless already
-    /// loading or loaded. `force` retries after a failure.
-    pub fn load_workspace_projects(&mut self, force: bool, cx: &mut Context<Self>) {
-        let Some((key, slug)) = self.credentials(cx) else {
+    /// Move a work item to `state_id` (optimistically; reverted with an error
+    /// when Plane refuses).
+    pub fn set_state(
+        &mut self,
+        link: &PlaneProjectLink,
+        item_id: &str,
+        state_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.api_key(cx) else {
             return;
         };
-        match self.workspace_projects {
-            WorkspaceProjects::Loading(_) | WorkspaceProjects::Loaded(_) if !force => return,
-            WorkspaceProjects::Failed(_) if !force => return,
-            _ => {}
+        let cache = cache_key(link);
+        let Some(entry) = self.projects.get_mut(&cache) else {
+            return;
+        };
+        let Some(state) = entry.states.iter().find(|s| s.id == state_id).cloned() else {
+            return;
+        };
+        let Some(item) = entry.items.iter_mut().find(|i| i.id == item_id) else {
+            return;
+        };
+        if item.state_id.as_deref() == Some(state_id) {
+            return;
         }
-        let fetch = gpui_tokio::Tokio::spawn(cx, fetch_projects(key, slug));
-        self.workspace_projects = WorkspaceProjects::Loading(cx.spawn(async move |this, cx| {
+        let previous = item.clone();
+        item.apply_state(&state);
+        entry.error = None;
+
+        let patch = gpui_tokio::Tokio::spawn(
+            cx,
+            patch_state(
+                key,
+                link.workspace_slug.clone(),
+                link.id.clone(),
+                item_id.to_owned(),
+                state_id.to_owned(),
+            ),
+        );
+        let item_id = item_id.to_owned();
+        let task_item = item_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = match patch.await {
+                Ok(result) => result,
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = this.update(cx, |store: &mut PlaneStore, cx| {
+                let Some(entry) = store.projects.get_mut(&cache) else {
+                    return;
+                };
+                entry.updates.remove(&task_item);
+                if let Err(err) = result {
+                    if let Some(item) = entry.items.iter_mut().find(|i| i.id == task_item) {
+                        *item = previous;
+                    }
+                    entry.error = Some(format!("Couldn't change the state: {err}").into());
+                }
+                cx.notify();
+            });
+        });
+        entry.updates.insert(item_id, task);
+        cx.notify();
+    }
+
+    pub fn workspace_projects(&self, slug: &str) -> Option<&WorkspaceProjects> {
+        self.workspace_projects.get(slug)
+    }
+
+    /// Load `slug`'s project list (for linking) unless already loading or
+    /// loaded. `force` retries after a failure.
+    pub fn load_workspace_projects(&mut self, slug: &str, force: bool, cx: &mut Context<Self>) {
+        let Some(key) = self.api_key(cx) else {
+            return;
+        };
+        let slug = slug.trim().trim_matches('/').to_owned();
+        if slug.is_empty() {
+            return;
+        }
+        match self.workspace_projects.get(&slug) {
+            Some(WorkspaceProjects::NotLoaded) | None => {}
+            Some(_) if !force => return,
+            Some(_) => {}
+        }
+        let fetch = gpui_tokio::Tokio::spawn(cx, fetch_projects(key, slug.clone()));
+        let task_slug = slug.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = match fetch.await {
                 Ok(result) => result,
                 Err(err) => Err(err.to_string()),
             };
             let _ = this.update(cx, |store: &mut PlaneStore, cx| {
-                store.workspace_projects = match result {
+                let loaded = match result {
                     Ok(mut projects) => {
                         projects.sort_by_key(|p| p.name.to_lowercase());
                         WorkspaceProjects::Loaded(projects)
                     }
                     Err(err) => WorkspaceProjects::Failed(err.into()),
                 };
+                store.workspace_projects.insert(task_slug, loaded);
                 cx.notify();
             });
-        }));
+        });
+        self.workspace_projects
+            .insert(slug, WorkspaceProjects::Loading(task));
         cx.notify();
     }
 }
@@ -409,6 +540,10 @@ struct RawIssue {
     state: Option<String>,
     #[serde(default)]
     priority: Option<String>,
+    #[serde(default)]
+    description_html: Option<String>,
+    #[serde(default)]
+    description_stripped: Option<String>,
 }
 
 fn client() -> Result<reqwest::Client, String> {
@@ -416,6 +551,23 @@ fn client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())
+}
+
+/// Map a non-success response to a readable error.
+async fn check(response: reqwest::Response) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err("Plane rejected the API key. Check it in Settings → Plane.".into());
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err("Not found on Plane — check the workspace slug and project link.".into());
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let body: String = body.chars().take(200).collect();
+        return Err(format!("Plane API error {}: {body}", status.as_u16()));
+    }
+    Ok(response)
 }
 
 async fn get_page<T: serde::de::DeserializeOwned>(
@@ -429,19 +581,8 @@ async fn get_page<T: serde::de::DeserializeOwned>(
         .send()
         .await
         .map_err(|e| format!("Couldn't reach Plane: {e}"))?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err("Plane rejected the API key. Check it in Settings → Plane.".into());
-    }
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Err("Not found on Plane — check the workspace slug and project link.".into());
-    }
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(200).collect();
-        return Err(format!("Plane API error {}: {body}", status.as_u16()));
-    }
-    response
+    check(response)
+        .await?
         .json::<ListResponse<T>>()
         .await
         .map(Paged::from)
@@ -481,19 +622,41 @@ async fn fetch_work_items(
     key: String,
     slug: String,
     project_id: String,
-) -> Result<Vec<WorkItem>, String> {
+) -> Result<(Vec<WorkItem>, Vec<PlaneState>), String> {
     let client = client()?;
     let base = format!("{API_BASE}/workspaces/{slug}/projects/{project_id}");
     let (states_url, issues_url) = (format!("{base}/states/"), format!("{base}/issues/"));
-    let (states, issues) = futures::try_join!(
+    let (raw_states, issues) = futures::try_join!(
         get_all::<RawState>(&client, &key, &states_url),
         get_all::<RawIssue>(&client, &key, &issues_url),
     )?;
-    let states: HashMap<String, RawState> = states.into_iter().map(|s| (s.id.clone(), s)).collect();
+    let mut states: Vec<PlaneState> = raw_states
+        .into_iter()
+        .map(|s| PlaneState {
+            group: StateGroup::parse(&s.group),
+            color: parse_hex(&s.color).unwrap_or_else(|| gpui::rgb(0x808080).into()),
+            name: s.name.into(),
+            id: s.id,
+        })
+        .collect();
+    states.sort_by(|a, b| {
+        a.group
+            .sort_key()
+            .cmp(&b.group.sort_key())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let by_id: HashMap<&str, &PlaneState> = states.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut items: Vec<WorkItem> = issues
         .into_iter()
         .map(|issue| {
-            let state = issue.state.as_deref().and_then(|id| states.get(id));
+            let state = issue.state.as_deref().and_then(|id| by_id.get(id).copied());
+            let description = issue
+                .description_html
+                .as_deref()
+                .map(html_to_text)
+                .filter(|text| !text.is_empty())
+                .or(issue.description_stripped)
+                .unwrap_or_default();
             WorkItem {
                 link: format!(
                     "{APP_BASE}/{slug}/projects/{project_id}/issues/{}",
@@ -502,22 +665,38 @@ async fn fetch_work_items(
                 id: issue.id,
                 sequence_id: issue.sequence_id,
                 title: issue.name.into(),
-                state_name: state
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| "Unknown".into())
-                    .into(),
-                state_group: state
-                    .map(|s| StateGroup::parse(&s.group))
-                    .unwrap_or(StateGroup::Unknown),
+                description: description.into(),
+                state_id: issue.state,
+                state_name: state.map(|s| s.name.clone()).unwrap_or("Unknown".into()),
+                state_group: state.map(|s| s.group).unwrap_or(StateGroup::Unknown),
                 state_color: state
-                    .and_then(|s| parse_hex(&s.color))
+                    .map(|s| s.color)
                     .unwrap_or_else(|| gpui::rgb(0x808080).into()),
                 priority: Priority::parse(issue.priority.as_deref()),
             }
         })
         .collect();
     sort_items(&mut items);
-    Ok(items)
+    Ok((items, states))
+}
+
+async fn patch_state(
+    key: String,
+    slug: String,
+    project_id: String,
+    item_id: String,
+    state_id: String,
+) -> Result<(), String> {
+    let client = client()?;
+    let url = format!("{API_BASE}/workspaces/{slug}/projects/{project_id}/issues/{item_id}/");
+    let response = client
+        .patch(url)
+        .header("X-API-Key", key)
+        .json(&serde_json::json!({ "state": state_id }))
+        .send()
+        .await
+        .map_err(|e| format!("Couldn't reach Plane: {e}"))?;
+    check(response).await.map(|_| ())
 }
 
 /// pi-todos order: priority, then state group, then title.
@@ -528,6 +707,73 @@ fn sort_items(items: &mut [WorkItem]) {
             .then(a.state_group.sort_key().cmp(&b.state_group.sort_key()))
             .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
     });
+}
+
+/// Plane descriptions are rich-text HTML. Keep the paragraph structure
+/// (block tags → newlines, list items → bullets), drop every other tag, and
+/// decode the entities pi-todos' `stripHtml` handles.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find('>') else {
+            rest = "";
+            break;
+        };
+        let tag = rest[start + 1..start + end]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let closing = rest[start + 1..].starts_with('/');
+        match tag.as_str() {
+            "br" => out.push('\n'),
+            "li" if !closing => out.push_str("\n• "),
+            "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "pre"
+            | "blockquote"
+                if closing =>
+            {
+                out.push('\n')
+            }
+            _ => {}
+        }
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    // Trim each line; a run of blank lines becomes one paragraph gap, except
+    // between consecutive bullets (each `<li><p>` ends in its own newline).
+    // Leaving a list always opens a new paragraph.
+    let mut text = String::new();
+    let mut gap = false;
+    let mut prev_bullet = false;
+    for line in decoded.lines().map(str::trim) {
+        if line.is_empty() {
+            gap = true;
+            continue;
+        }
+        let bullet = line.starts_with('•');
+        if !text.is_empty() {
+            let leaving_list = prev_bullet && !bullet;
+            text.push_str(if leaving_list || (gap && !(prev_bullet && bullet)) {
+                "\n\n"
+            } else {
+                "\n"
+            });
+        }
+        text.push_str(line);
+        gap = false;
+        prev_bullet = bullet;
+    }
+    text
 }
 
 fn parse_hex(raw: &str) -> Option<Hsla> {
@@ -548,12 +794,14 @@ fn parse_hex(raw: &str) -> Option<Hsla> {
 mod tests {
     use super::*;
 
-    fn item(title: &str, group: StateGroup, priority: Priority) -> WorkItem {
+    fn item(title: &str, state: &str, group: StateGroup, priority: Priority) -> WorkItem {
         WorkItem {
             id: title.into(),
             sequence_id: Some(1),
             title: title.to_owned().into(),
-            state_name: "S".into(),
+            description: "".into(),
+            state_id: None,
+            state_name: state.to_owned().into(),
             state_group: group,
             state_color: gpui::rgb(0).into(),
             priority,
@@ -564,10 +812,10 @@ mod tests {
     #[test]
     fn sorts_by_priority_then_group_then_title() {
         let mut items = vec![
-            item("b", StateGroup::Backlog, Priority::None),
-            item("a", StateGroup::Backlog, Priority::None),
-            item("c", StateGroup::Started, Priority::None),
-            item("d", StateGroup::Backlog, Priority::Urgent),
+            item("b", "Backlog", StateGroup::Backlog, Priority::None),
+            item("a", "Backlog", StateGroup::Backlog, Priority::None),
+            item("c", "In Progress", StateGroup::Started, Priority::None),
+            item("d", "Backlog", StateGroup::Backlog, Priority::Urgent),
         ];
         sort_items(&mut items);
         let order: Vec<&str> = items.iter().map(|i| i.title.as_ref()).collect();
@@ -576,7 +824,7 @@ mod tests {
 
     #[test]
     fn keys_use_the_project_identifier() {
-        let i = item("x", StateGroup::Started, Priority::None);
+        let i = item("x", "Todo", StateGroup::Unstarted, Priority::None);
         assert_eq!(i.key("WEB").as_ref(), "WEB-1");
         assert_eq!(i.key("").as_ref(), "#1");
     }
@@ -586,6 +834,24 @@ mod tests {
         assert_eq!(parse_hex("#ffffff"), parse_hex("fff"));
         assert!(parse_hex("#12").is_none());
         assert!(parse_hex("").is_none());
+    }
+
+    #[test]
+    fn in_progress_matches_the_state_name_not_the_group() {
+        // pi-todos pins `state_name === "In Progress"`: another started-group
+        // state (e.g. "In Review") is not a pill.
+        assert!(item("x", "In Progress", StateGroup::Started, Priority::None).in_progress());
+        assert!(!item("x", "In Review", StateGroup::Started, Priority::None).in_progress());
+        assert!(!item("x", "Todo", StateGroup::Unstarted, Priority::None).in_progress());
+        assert!(!StateGroup::Completed.is_active());
+        assert!(StateGroup::Triage.is_active());
+    }
+
+    #[test]
+    fn html_descriptions_keep_paragraphs_and_bullets() {
+        let html = "<p>First &amp; <strong>bold</strong></p><p></p><ul><li><p>one</p></li><li>two</li></ul><p>a<br>b</p>";
+        assert_eq!(html_to_text(html), "First & bold\n\n• one\n• two\n\na\nb");
+        assert_eq!(html_to_text("<p></p>"), "");
     }
 
     #[test]
@@ -610,10 +876,32 @@ mod tests {
     }
 
     #[test]
-    fn only_started_counts_as_in_progress() {
-        assert!(item("x", StateGroup::Started, Priority::None).in_progress());
-        assert!(!item("x", StateGroup::Unstarted, Priority::None).in_progress());
-        assert!(!StateGroup::Completed.is_active());
-        assert!(StateGroup::Triage.is_active());
+    fn legacy_links_inherit_the_default_workspace() {
+        let mut plane = crate::settings::PlaneSettings {
+            api_key: "k".into(),
+            workspace_slug: "acme".into(),
+            ..Default::default()
+        };
+        plane.projects.insert(
+            "s".into(),
+            PlaneProjectLink {
+                id: "p".into(),
+                ..Default::default()
+            },
+        );
+        plane.projects.insert(
+            "t".into(),
+            PlaneProjectLink {
+                workspace_slug: "other".into(),
+                id: "q".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(plane.link("s").unwrap().workspace_slug, "acme");
+        assert_eq!(plane.link("t").unwrap().workspace_slug, "other");
+        assert_ne!(
+            cache_key(&plane.link("s").unwrap()),
+            cache_key(&plane.link("t").unwrap())
+        );
     }
 }
