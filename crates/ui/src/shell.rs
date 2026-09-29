@@ -701,10 +701,8 @@ pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
-/// Worktree-tree geometry: one-line session rows sit under their worktree
-/// header, indented past the project chevron so the hierarchy reads at a
-/// glance without guide lines.
-const SIDEBAR_TREE_CHAT_ROW_HEIGHT: f32 = 28.0;
+/// Worktree-tree indent: worktree blocks sit past the project chevron so the
+/// hierarchy reads at a glance without guide lines.
 const SIDEBAR_TREE_INDENT: f32 = 12.0;
 /// Harness/title geometry follows the row hierarchy: active multi-line cards
 /// keep identity close on the standard 8px rhythm, while the one-line archived
@@ -5658,9 +5656,6 @@ impl Shell {
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
-        // Worktree-tree rows: one indented line (harness, title, corner). The
-        // project and branch already live on the headers above the row.
-        nested: bool,
         // This row's jump combo while the hint overlay is up. It takes the
         // corner outright — above hover and above the status word — so all
         // nine chips appear together instead of leaving a hole on whichever
@@ -5954,19 +5949,6 @@ impl Shell {
                     cx.notify();
                 }),
             );
-        if nested {
-            return row
-                .h(px(SIDEBAR_TREE_CHAT_ROW_HEIGHT))
-                .pl(px(Theme::SPACE_SM + SIDEBAR_TREE_INDENT))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
-                .children(harness_icon)
-                .child(title_label)
-                .child(div().text_color(subline).child(corner))
-                .into_any_element();
-        }
         row.h(px(chat_row_height(
             branch.is_some(),
             change_request.is_some(),
