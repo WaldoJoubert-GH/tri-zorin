@@ -1917,6 +1917,46 @@ impl AppState {
         self.restart_router_watches(cx, router);
     }
 
+    /// Startup: connect every saved SSH device marked `auto_connect`, each on
+    /// its own so a slow or unreachable host never holds up the others. Runs
+    /// unattended (no password / host-key prompts); a failure is logged and the
+    /// device stays available to Connect by hand in Settings → Devices.
+    pub fn auto_connect_ssh_targets(&mut self, cx: &mut Context<Self>) {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let targets: Vec<zeron_rpc::ssh::SshTarget> = zeron_rpc::ssh::load_targets(&data_dir)
+            .into_iter()
+            .filter(|target| target.auto_connect)
+            .filter(|target| !self.is_remote_connected(&target.destination()))
+            .collect();
+        for target in targets {
+            let edge_url = self.edge_url.clone();
+            let destination = target.destination();
+            let connect = Tokio::spawn(cx, async move {
+                EngineHandle::connect_ssh(&target.unattended(), &edge_url).await
+            });
+            cx.spawn(async move |this, cx| {
+                let outcome = match connect.await {
+                    Ok(Ok(handle)) => Ok(handle),
+                    Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(join_err) => Err(join_err.to_string()),
+                };
+                match outcome {
+                    Ok(handle) => {
+                        tracing::info!(%destination, "ssh device auto-connected");
+                        this.update(cx, |state, cx| state.connect_remote_engine(handle, cx))
+                            .ok();
+                    }
+                    Err(message) => {
+                        tracing::warn!(%destination, %message, "ssh auto-connect failed");
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
     pub fn is_remote_connected(&self, destination: &str) -> bool {
         self.engine
             .as_ref()
@@ -2005,7 +2045,10 @@ impl AppState {
             // closure's value directly (no Result) — AsyncApp implements
             // AppContext like App does.
             state.update(cx, |s, cx| match outcome {
-                Ok(handle) => s.attach_engine(handle, cx),
+                Ok(handle) => {
+                    s.attach_engine(handle, cx);
+                    s.auto_connect_ssh_targets(cx);
+                }
                 Err(message) => {
                     tracing::error!(%message, "engine bootstrap failed");
                     s.connection = ConnectionStatus::Failed(message);

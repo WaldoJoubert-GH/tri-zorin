@@ -63,10 +63,19 @@ pub struct SshTarget {
     /// the released headless build for their OS/arch (restricted-egress hosts).
     #[serde(default)]
     pub upload_binary_over_ssh: bool,
+    /// Connect this device when the app starts. On by default (targets saved
+    /// before the flag existed included); Connect sets it, Disconnect clears it,
+    /// so startup restores whatever the user last left connected.
+    #[serde(default = "default_auto_connect")]
+    pub auto_connect: bool,
 }
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_auto_connect() -> bool {
+    true
 }
 
 impl SshTarget {
@@ -80,7 +89,22 @@ impl SshTarget {
             extra_args: Vec::new(),
             nickname: None,
             upload_binary_over_ssh: false,
+            auto_connect: true,
         }
+    }
+
+    /// A copy that never waits on a prompt: no one is at a terminal when the
+    /// app connects at startup, so a host that needs a password or an unknown
+    /// host key fails fast instead of hanging. Keys and agents still work.
+    pub fn unattended(&self) -> Self {
+        let mut target = self.clone();
+        target.extra_args.extend([
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            "ConnectTimeout=10".to_string(),
+        ]);
+        target
     }
 
     /// `user@host:port` label (Orca edit-dialog style).

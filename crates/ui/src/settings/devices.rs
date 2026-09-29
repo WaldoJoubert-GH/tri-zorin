@@ -217,6 +217,7 @@ impl DevicesPage {
     /// Add this SSH device to the engine hub. The home workspace remains live
     /// and the router sends calls for the connected device to this engine.
     fn connect_ssh_target(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        self.set_ssh_auto_connect(&target, true, cx);
         let id = target.id.clone();
         let edge_url = self.state.read(cx).edge_url.clone();
         self.ssh_status.insert(id.clone(), "Connecting…".into());
@@ -257,11 +258,31 @@ impl DevicesPage {
         }));
     }
 
-    fn disconnect_ssh_target(&mut self, destination: String, cx: &mut Context<Self>) {
+    fn disconnect_ssh_target(&mut self, target: SshTarget, cx: &mut Context<Self>) {
+        self.set_ssh_auto_connect(&target, false, cx);
         self.state.update(cx, |state, cx| {
-            state.disconnect_remote_engine(&destination, cx);
+            state.disconnect_remote_engine(&target.destination(), cx);
         });
         cx.notify();
+    }
+
+    /// Startup reconnects what the user last left connected: Connect turns
+    /// `auto_connect` on, Disconnect turns it off.
+    fn set_ssh_auto_connect(&mut self, target: &SshTarget, on: bool, cx: &mut Context<Self>) {
+        if target.auto_connect == on {
+            return;
+        }
+        let Some(dir) = self.data_dir(cx) else {
+            return;
+        };
+        let mut target = target.clone();
+        target.auto_connect = on;
+        match ssh::upsert_target(&dir, target) {
+            Ok(targets) => self.ssh_targets = targets,
+            Err(err) => {
+                self.ssh_error = Some(SharedString::from(format!("Save failed: {err}")));
+            }
+        }
     }
 
     fn test_ssh_target(&mut self, target: SshTarget, cx: &mut Context<Self>) {
@@ -538,6 +559,14 @@ impl DevicesPage {
                             .into_any_element(),
                     );
                 }
+                if target.auto_connect {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(SharedString::from("connects at startup"))
+                            .into_any_element(),
+                    );
+                }
                 widgets::card_row(&theme, ix == 0)
                     .child(widgets::row_tile(&theme, crate::icons::MONITOR))
                     .child(
@@ -560,7 +589,7 @@ impl DevicesPage {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if is_active {
-                                    this.disconnect_ssh_target(destination.clone(), cx);
+                                    this.disconnect_ssh_target(connect_target.clone(), cx);
                                 } else {
                                     this.connect_ssh_target(connect_target.clone(), cx);
                                 }

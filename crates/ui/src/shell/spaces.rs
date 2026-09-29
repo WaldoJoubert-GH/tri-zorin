@@ -66,6 +66,17 @@ impl SidebarTreeKeys {
     }
 }
 
+/// One project in the Projects & worktrees tree. `space_id` is set when the
+/// project is a real space (the "~" bucket and dangling ids have none), and
+/// gates its new-session affordances.
+struct TreeProject {
+    key: String,
+    name: String,
+    device: Option<String>,
+    space_id: Option<String>,
+    rows: Vec<ActiveChatRow>,
+}
+
 /// Group items by key in first-appearance order, keeping each group's items
 /// in their incoming order. The tree keeps the user's sort this way: the
 /// project with the most recent session leads, and so on down.
@@ -1551,18 +1562,36 @@ impl Shell {
         // Same flat slot order `sidebar_visible_order` hands the jump keys.
         let mut slot = 0usize;
         let mut rendered = Vec::new();
-        let projects = group_by_first_appearance(rows, |row| row.tree.project_key.clone());
-        for (index, (project_key, rows)) in projects.into_iter().enumerate() {
-            let project = rows[0].tree.project.clone();
-            let device = rows[0].tree.device.clone();
+        let projects = self.sidebar_tree_projects(rows, cx);
+        for (index, project) in projects.into_iter().enumerate() {
+            let TreeProject {
+                key: project_key,
+                name: project,
+                device,
+                space_id,
+                rows,
+            } = project;
             let session_count = rows.len();
             let working = rows.iter().any(|row| row.status == ChatIndicator::Working);
 
             let worktrees = group_by_first_appearance(rows, |row| row.tree.worktree_key.clone());
             let worktree_count = worktrees.len();
-            let mut blocks = Vec::with_capacity(worktree_count);
+            let mut blocks = Vec::with_capacity(worktree_count.max(1));
             let mut body_height = SIDEBAR_DISCLOSURE_BODY_INSET
                 + SIDEBAR_TREE_WORKTREE_GAP * worktree_count.saturating_sub(1) as f32;
+            // A project with no sessions yet still shows, with one row that
+            // starts its first.
+            if worktrees.is_empty()
+                && let Some(space_id) = space_id.clone()
+            {
+                body_height += SIDEBAR_TREE_WORKTREE_HEADER_HEIGHT;
+                blocks.push(div().w_full().child(self.render_tree_new_session_row(
+                    &project_key,
+                    space_id,
+                    theme,
+                    cx,
+                )));
+            }
             for (worktree_key, rows) in worktrees {
                 let header = self.render_worktree_header(
                     format!("{project_key}/{worktree_key}"),
@@ -1640,6 +1669,7 @@ impl Shell {
                     device.map(SharedString::from),
                     session_count,
                     working,
+                    space_id,
                     chevron,
                     theme,
                     cx,
@@ -1702,14 +1732,17 @@ impl Shell {
         device: Option<SharedString>,
         session_count: usize,
         working: bool,
+        new_session_in: Option<String>,
         chevron: AnyElement,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let hover = theme.glass_hover();
         let subline = theme.text_muted.opacity(0.5);
+        let group = SharedString::from(format!("sidebar-{key}-group"));
         div()
             .id(SharedString::from(format!("sidebar-{key}")))
+            .group(group.clone())
             .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
             .flex()
             .flex_row()
@@ -1760,6 +1793,114 @@ impl Shell {
                     .text_color(subline)
                     .child(SharedString::from(session_count.to_string())),
             )
+            // Orca's "+" on a repo row: a new session in this project. Faint
+            // at rest, full on row hover, so the column stays quiet.
+            .when_some(new_session_in, |el, space_id| {
+                let text = theme.text;
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("sidebar-{key}-new")))
+                        .flex_none()
+                        .size(px(18.0))
+                        .mr(px(-4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .opacity(0.35)
+                        .group_hover(group, |s| s.opacity(1.0))
+                        .text_color(theme.text_muted)
+                        .hover(move |s| s.bg(crate::theme::wash(0.18)).text_color(text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.land_in_space(space_id.clone(), cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::PLUS)
+                                .size(px(12.0))
+                                .flex_none(),
+                        ),
+                )
+            })
+    }
+
+    /// The row an empty project shows in its body: "New session", opening
+    /// the new-session canvas in that project.
+    fn render_tree_new_session_row(
+        &self,
+        key: &str,
+        space_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover = theme.glass_hover();
+        let text = theme.text;
+        div()
+            .id(SharedString::from(format!("sidebar-{key}-empty-new")))
+            .h(px(SIDEBAR_TREE_WORKTREE_HEADER_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
+            .pl(px(Theme::SPACE_SM + SIDEBAR_TREE_INDENT))
+            .pr(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_muted.opacity(0.55))
+            .hover(move |style| style.bg(hover).text_color(text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.land_in_space(space_id.clone(), cx);
+            }))
+            .child(
+                div()
+                    .w(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        crate::icons::icon(crate::icons::PLUS)
+                            .size(px(12.0))
+                            .flex_none(),
+                    ),
+            )
+            .child(SharedString::from("New session"))
+            .into_any_element()
+    }
+
+    /// The tree's projects: those with sessions first, in the user's sort
+    /// (first appearance), then every other project in name order. A project
+    /// stays in the tree with no sessions, as in Orca. The space filter
+    /// narrows both to one project.
+    fn sidebar_tree_projects(&self, rows: Vec<ActiveChatRow>, cx: &App) -> Vec<TreeProject> {
+        let state = self.state.read(cx);
+        let mut projects: Vec<TreeProject> =
+            group_by_first_appearance(rows, |row| row.tree.project_key.clone())
+                .into_iter()
+                .map(|(key, rows)| TreeProject {
+                    space_id: state.space_row(&key).map(|space| space.id.clone()),
+                    name: rows[0].tree.project.clone(),
+                    device: rows[0].tree.device.clone(),
+                    key,
+                    rows,
+                })
+                .collect();
+        let filter = self.settings.space_filter.as_deref();
+        let empty: Vec<TreeProject> = state
+            .spaces_sorted()
+            .into_iter()
+            .filter(|space| filter.is_none_or(|id| id == space.id))
+            .filter(|space| !projects.iter().any(|project| project.key == space.id))
+            .map(|space| TreeProject {
+                key: space.id.clone(),
+                name: space.display_name().to_string(),
+                device: state.device_name(&space.device_id).map(str::to_string),
+                space_id: Some(space.id.clone()),
+                rows: Vec::new(),
+            })
+            .collect();
+        projects.extend(empty);
+        projects
     }
 
     /// A worktree header in the tree: its most urgent status, the branch
