@@ -414,16 +414,19 @@ pub enum SettingsSection {
     Shortcuts,
     Appshots,
     Archived,
+    /// Plane.so connection and project links.
+    Plane,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
         SettingsSection::Notifications,
+        SettingsSection::Plane,
         SettingsSection::Shortcuts,
         SettingsSection::Appshots,
         SettingsSection::Archived,
@@ -442,6 +445,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Appshots => "Appshots",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Plane => "Plane",
         }
     }
 }
@@ -482,6 +486,8 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// Plane.so work items of the session's project ([`Shell::plane_view`]).
+    Plane,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -1454,6 +1460,11 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    plane_page: Option<Entity<crate::settings::plane::PlaneSettingsPage>>,
+    /// Shared Plane cache behind the Plane surface and the composer pills.
+    plane_store: Entity<crate::plane::PlaneStore>,
+    /// The one Plane surface; its content follows the session's project.
+    plane_view: Option<(Entity<crate::plane_view::PlaneView>, Subscription)>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1640,6 +1651,10 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let plane_store = cx.new(crate::plane::PlaneStore::new);
+        composer.update(cx, |composer, cx| {
+            composer.set_plane_store(plane_store.clone(), cx)
+        });
         let links = Self::session_links(None, cx);
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
@@ -1648,7 +1663,10 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::OpenPlaneItem { item_id, link } => {
+                    this.reveal_plane_item(item_id.clone(), link.clone(), cx);
+                }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -1730,6 +1748,7 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("settings/plane") => Route::Settings(SettingsSection::Plane),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1821,6 +1840,9 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            plane_page: None,
+            plane_store,
+            plane_view: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -2463,6 +2485,7 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                RightSurface::Plane => Some((*surface, SharedString::from("Plane"), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -2483,7 +2506,8 @@ impl Shell {
             | RightSurface::Diff(_)
             | RightSurface::Terminal(_)
             | RightSurface::Subagent(_)
-            | RightSurface::Browser(_) => {
+            | RightSurface::Browser(_)
+            | RightSurface::Plane => {
                 return None;
             }
         };
@@ -2585,7 +2609,7 @@ impl Shell {
             }
             // The tab's feed (watch or snapshot) runs from open to close —
             // activation needs no revalidation.
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::Plane => {}
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -3048,6 +3072,54 @@ impl Shell {
         }
     }
 
+    /// The shared Plane surface, created on first use.
+    fn plane_view(&mut self, cx: &mut Context<Self>) -> Entity<crate::plane_view::PlaneView> {
+        if let Some((view, _)) = &self.plane_view {
+            return view.clone();
+        }
+        let state = self.state.clone();
+        let store = self.plane_store.clone();
+        let view = cx.new(|cx| crate::plane_view::PlaneView::new(state, store, cx));
+        let sub = cx.subscribe(&view, |this, _, event, cx| match event {
+            crate::plane_view::PlaneViewEvent::OpenSettings => {
+                this.open_settings(SettingsSection::Plane, cx)
+            }
+        });
+        self.plane_view = Some((view.clone(), sub));
+        view
+    }
+
+    /// The picker's Plane card / the `+` menu's Plane row. One Plane tab per
+    /// session; a second request just focuses it.
+    fn add_plane_surface(&mut self, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+        push_unique_right_surface(self.right_tabs.entry(key).or_default(), RightSurface::Plane);
+        self.set_right_active(RightSurface::Plane, cx);
+    }
+
+    /// A composer pill: open the right pane on the Plane tab with `item_id`
+    /// highlighted. The new-session canvas has no right pane, so there the
+    /// item opens on app.plane.so instead.
+    fn reveal_plane_item(
+        &mut self,
+        item_id: Option<String>,
+        link: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_chat.is_empty() {
+            if let Some(link) = link {
+                cx.open_url(&link);
+            }
+            return;
+        }
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        self.add_plane_surface(cx);
+        let view = self.plane_view(cx);
+        view.update(cx, |view, cx| view.reveal(item_id, cx));
+    }
+
     /// Spawn-chip events from the primary transcript AND from subagent-tab
     /// transcripts (nested spawns open their own tabs).
     fn on_transcript_event(
@@ -3251,7 +3323,8 @@ impl Shell {
                         .update(cx, |s, _| s.unwatch_subagent_doc(&tab.doc_id));
                 }
             }
-            RightSurface::Picker => {}
+            // The view is shared across sessions; closing only drops the tab.
+            RightSurface::Plane | RightSurface::Picker => {}
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -3608,6 +3681,7 @@ impl Shell {
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
         self.settings.transcript_width = current.transcript_width;
+        self.settings.plane = current.plane;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -3978,6 +4052,15 @@ impl Shell {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
+            }
+            SettingsSection::Plane => {
+                let state = self.state.clone();
+                self.plane_page
+                    .get_or_insert_with(|| {
+                        cx.new(|cx| crate::settings::plane::PlaneSettingsPage::new(state, cx))
+                    })
+                    .clone()
+                    .into_any_element()
             }
         }
     }
@@ -5448,6 +5531,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Appshots => icons::MONITOR,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Plane => icons::CHECKLIST,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -8149,6 +8233,7 @@ impl Shell {
                     .cloned()
                     .map(|browser| browser.into_any_element())
                     .unwrap_or_else(|| self.render_surface_picker(cx)),
+                RightSurface::Plane => self.plane_view(cx).into_any_element(),
                 RightSurface::Terminal(tab) => {
                     let panel = self.right_terminal_panel(cx);
                     // Keep the embedded panel's own active tab aligned with
@@ -8310,6 +8395,13 @@ impl Shell {
                         row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.add_terminal_surface(cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        row("surface-card-plane", icons::CHECKLIST, "Plane").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.add_plane_surface(cx);
                             }),
                         ),
                     )
@@ -8520,6 +8612,7 @@ impl Shell {
                 RightSurface::Subagent(_) => icons::BOT,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
+                RightSurface::Plane => icons::CHECKLIST,
                 RightSurface::Picker => icons::PLUS,
             };
             // A live subagent tab swaps its icon for the mini working
@@ -8845,6 +8938,20 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 )
                                 .child(SharedString::from("Terminal")),
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, "right-plus-plane")
+                                .id("right-plus-plane-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_plane_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::CHECKLIST)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Plane")),
                         )
                         .when(self.space_git_detected(cx), |menu| {
                             menu.child(

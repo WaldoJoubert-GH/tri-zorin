@@ -22,6 +22,7 @@ pub mod devices;
 pub mod files;
 pub mod harnesses;
 pub mod notifications;
+pub mod plane;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -344,6 +345,14 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
 pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
+        .unwrap_or_default()
+}
+
+/// The Plane block alone — cheap enough for per-frame reads (the composer
+/// pills), unlike cloning all of [`current`].
+pub fn plane(cx: &App) -> PlaneSettings {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.plane.clone())
         .unwrap_or_default()
 }
 
@@ -692,6 +701,53 @@ impl Default for GitHistoryColumns {
     }
 }
 
+/// Plane.so credentials plus which Plane project each Zeron project (space)
+/// tracks. Device-local: the API key is stored in `ui-settings.json` on this
+/// machine only. One personal access token reaches every workspace its owner
+/// belongs to, so the key is global while each link names its own workspace.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlaneSettings {
+    pub api_key: String,
+    /// Default workspace offered when linking a project. Links made before
+    /// per-project workspaces existed fall back to it.
+    pub workspace_slug: String,
+    /// Space id → linked Plane project.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub projects: std::collections::HashMap<String, PlaneProjectLink>,
+}
+
+impl PlaneSettings {
+    pub fn is_unset(&self) -> bool {
+        self.api_key.is_empty() && self.workspace_slug.is_empty() && self.projects.is_empty()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.api_key.trim().is_empty()
+    }
+
+    /// The link for `space_id` with its workspace resolved (legacy links
+    /// inherit [`Self::workspace_slug`]).
+    pub fn link(&self, space_id: &str) -> Option<PlaneProjectLink> {
+        let mut link = self.projects.get(space_id)?.clone();
+        if link.workspace_slug.is_empty() {
+            link.workspace_slug = self.workspace_slug.trim().to_owned();
+        }
+        Some(link)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlaneProjectLink {
+    /// Workspace the project lives in (`app.plane.so/<slug>`).
+    pub workspace_slug: String,
+    pub id: String,
+    /// Short work-item prefix (`WEB` in `WEB-42`).
+    pub identifier: String,
+    pub name: String,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GitHistoryAuthorDisplay {
@@ -980,6 +1036,11 @@ pub struct UiSettings {
     /// Whether (and how strongly) the project's background stays visible
     /// behind an open chat, rather than dissolving once the thread docks.
     pub chat_background: ChatBackgroundVisibility,
+    /// Plane.so connection and per-project links (Settings → Plane, the Plane
+    /// right-pane surface). Mutated outside the Shell — see
+    /// `Shell::sync_independent_settings`.
+    #[serde(default, skip_serializing_if = "PlaneSettings::is_unset")]
+    pub plane: PlaneSettings,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -1047,6 +1108,7 @@ impl Default for UiSettings {
             space_backgrounds: std::collections::HashMap::new(),
             space_background_effects: std::collections::HashMap::new(),
             chat_background: ChatBackgroundVisibility::default(),
+            plane: PlaneSettings::default(),
             legacy_accent_color: None,
         }
     }
@@ -2340,12 +2402,26 @@ mod tests {
                 NewThreadBackgroundEffect::Dither,
             )]),
             chat_background: ChatBackgroundVisibility::Strong,
+            plane: PlaneSettings {
+                api_key: "plane_api_test".into(),
+                workspace_slug: "acme".into(),
+                projects: std::collections::HashMap::from([(
+                    "space-1".to_string(),
+                    PlaneProjectLink {
+                        workspace_slug: "acme-web".into(),
+                        id: "p-1".into(),
+                        identifier: "WEB".into(),
+                        name: "Website".into(),
+                    },
+                )]),
+            },
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
         assert!(json.contains(r#""chatBackground": "strong""#));
+        assert!(json.contains(r#""workspaceSlug": "acme""#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));

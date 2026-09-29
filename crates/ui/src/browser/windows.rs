@@ -22,8 +22,7 @@ pub(super) struct ParentWindow(Win32WindowHandle);
 
 impl ParentWindow {
     pub(super) fn from_window(window: &Window) -> Result<Self, String> {
-        match window
-            .window_handle()
+        match HasWindowHandle::window_handle(window)
             .map_err(|error: HandleError| error.to_string())?
             .as_raw()
         {

@@ -54,6 +54,7 @@ gpui_tokio.workspace = true
 gpui-base.workspace = true
 tokio.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -87,7 +88,6 @@ block2 = "0.6"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSBitmapImageRep", "NSImage", "NSEvent", "NSResponder", "NSView", "NSWindow"] }
 objc2-foundation = "0.3.2"
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKNavigationDelegate", "WKNavigationAction", "WKSnapshotConfiguration"] }
-reqwest.workspace = true
 core-foundation = "0.10"
 core-graphics = { version = "0.24", features = ["elcapitan", "highsierra", "link"] }
 foreign-types = "0.5"
