@@ -20,6 +20,83 @@ struct ActiveChatRow {
     branch: Option<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
+    /// Tree placement for [`SidebarOrganization::ByWorktree`]. Computed from
+    /// the chat itself, so hiding the branch line never regroups the tree.
+    tree: SidebarTreeKeys,
+}
+
+/// Where a chat sits in the Projects & worktrees tree.
+#[derive(Clone, Debug, PartialEq)]
+struct SidebarTreeKeys {
+    project_key: String,
+    project: String,
+    device: Option<String>,
+    worktree_key: String,
+    worktree: String,
+}
+
+impl SidebarTreeKeys {
+    fn new(
+        chat: &zeron_proto::Chat,
+        project: String,
+        device: Option<String>,
+        branch: Option<&str>,
+    ) -> Self {
+        let project_key = chat.space_id.clone().unwrap_or_else(|| "~".to_string());
+        // A worktree is its checkout. Chats that predate checkout stamping
+        // fall back to the branch, then the folder, so they still cluster.
+        let worktree_key = chat
+            .checkout_id
+            .clone()
+            .or_else(|| chat.source_context.as_ref().map(|s| s.checkout_id.clone()))
+            .filter(|key| !key.is_empty())
+            .or_else(|| branch.map(|b| format!("branch:{b}")))
+            .or_else(|| chat.cwd.clone().map(|cwd| format!("cwd:{cwd}")))
+            .unwrap_or_else(|| "none".to_string());
+        let worktree = branch
+            .map(str::to_string)
+            .unwrap_or_else(|| "Local checkout".into());
+        Self {
+            project_key,
+            project,
+            device,
+            worktree_key,
+            worktree,
+        }
+    }
+}
+
+/// Group items by key in first-appearance order, keeping each group's items
+/// in their incoming order. The tree keeps the user's sort this way: the
+/// project with the most recent session leads, and so on down.
+fn group_by_first_appearance<T, K: PartialEq>(
+    items: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> K,
+) -> Vec<(K, Vec<T>)> {
+    let mut groups: Vec<(K, Vec<T>)> = Vec::new();
+    for item in items {
+        let k = key(&item);
+        match groups.iter_mut().find(|(existing, _)| *existing == k) {
+            Some((_, members)) => members.push(item),
+            None => groups.push((k, vec![item])),
+        }
+    }
+    groups
+}
+
+/// The status a worktree header wears: whatever most needs the user.
+fn worktree_status(statuses: impl IntoIterator<Item = ChatIndicator>) -> ChatIndicator {
+    let rank = |status: ChatIndicator| match status {
+        ChatIndicator::AwaitingInput => 0,
+        ChatIndicator::Errored => 1,
+        ChatIndicator::Working => 2,
+        ChatIndicator::Completed => 3,
+        ChatIndicator::Idle => 4,
+    };
+    statuses
+        .into_iter()
+        .min_by_key(|status| rank(*status))
+        .unwrap_or(ChatIndicator::Idle)
 }
 
 pub(super) fn compare_sidebar_chats(
@@ -82,6 +159,7 @@ impl Render for SidebarViewOptionsTooltip {
 
 #[derive(Clone, Copy)]
 enum SidebarViewRow {
+    ByWorktree,
     ByDevice,
     InOneList,
     LastUpdated,
@@ -97,12 +175,13 @@ impl SidebarViewRow {
     fn closes_menu(self) -> bool {
         matches!(
             self,
-            Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
+            Self::ByWorktree | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
         )
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 8] = [
+    SidebarViewRow::ByWorktree,
     SidebarViewRow::ByDevice,
     SidebarViewRow::InOneList,
     SidebarViewRow::LastUpdated,
@@ -120,6 +199,12 @@ const SIDEBAR_DISCLOSURE_HEADER_HEIGHT: f32 = 28.0;
 const SIDEBAR_DISCLOSURE_BODY_INSET: f32 = 4.0;
 const SIDEBAR_DISCLOSURE_SECTION_HEIGHT: f32 =
     SIDEBAR_SECTION_GAP + SIDEBAR_DISCLOSURE_HEADER_HEIGHT;
+/// Projects & worktrees tree: worktree headers are a notch shorter than
+/// session rows so the branch reads as a label over its sessions, worktrees
+/// in one project sit 6px apart, and projects 8px.
+const SIDEBAR_TREE_WORKTREE_HEADER_HEIGHT: f32 = 24.0;
+const SIDEBAR_TREE_WORKTREE_GAP: f32 = 6.0;
+const SIDEBAR_TREE_PROJECT_GAP: f32 = 8.0;
 pub(super) const SIDEBAR_DISCLOSURE_TWEEN_GRACE: std::time::Duration =
     std::time::Duration::from_millis(120);
 
@@ -584,6 +669,9 @@ impl Shell {
 
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
         match row {
+            SidebarViewRow::ByWorktree => {
+                self.settings.sidebar_organization = SidebarOrganization::ByWorktree
+            }
             SidebarViewRow::ByDevice => {
                 self.settings.sidebar_organization = SidebarOrganization::ByDevice
             }
@@ -658,6 +746,7 @@ impl Shell {
         let show_pr = self.settings.sidebar_show_pull_request;
 
         let labels = [
+            "Projects & worktrees",
             "By device",
             "In one list",
             "Last updated",
@@ -667,6 +756,7 @@ impl Shell {
             "Harness",
         ];
         let icons = [
+            icons::FOLDER,
             icons::LAPTOP,
             icons::LIST,
             icons::CLOCK_CIRCLE,
@@ -676,6 +766,7 @@ impl Shell {
             icons::BOT,
         ];
         let selected = [
+            organization == SidebarOrganization::ByWorktree,
             organization == SidebarOrganization::ByDevice,
             organization == SidebarOrganization::InOneList,
             sort == SidebarSort::LastUpdated,
@@ -719,8 +810,8 @@ impl Shell {
                 .into_any_element()
             })
             .collect();
-        let show_rows = rows.split_off(4);
-        let sort_rows = rows.split_off(2);
+        let show_rows = rows.split_off(5);
+        let sort_rows = rows.split_off(3);
         let organization_rows = rows;
 
         popover::popover_card(theme)
@@ -1175,6 +1266,21 @@ impl Shell {
             .map(|(_, chat)| chat.clone())
             .collect();
         chats.sort_by(|left, right| compare_sidebar_chats(self.settings.sidebar_sort, left, right));
+        if self.settings.sidebar_organization == SidebarOrganization::ByWorktree {
+            let keyed = chats.into_iter().map(|chat| {
+                let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+                    .map(|b| b.trim().to_string());
+                let keys = SidebarTreeKeys::new(&chat, String::new(), None, branch.as_deref());
+                (keys, chat.id)
+            });
+            return group_by_first_appearance(keyed, |(keys, _)| keys.project_key.clone())
+                .into_iter()
+                .flat_map(|(_, rows)| {
+                    group_by_first_appearance(rows, |(keys, _)| keys.worktree_key.clone())
+                })
+                .flat_map(|(_, rows)| rows.into_iter().map(|(_, id)| id))
+                .collect();
+        }
         if self.settings.sidebar_organization != SidebarOrganization::ByDevice {
             return chats.into_iter().map(|chat| chat.id).collect();
         }
@@ -1242,9 +1348,17 @@ impl Shell {
                         .filter(|b| !b.is_empty())
                         .map(str::to_string);
                     let change_request = state.change_request_for_chat(&chat).cloned();
+                    let tree = SidebarTreeKeys::new(
+                        &chat,
+                        project,
+                        state.device_name(&chat.device_id).map(str::to_string),
+                        branch.as_deref(),
+                    );
                     let group = match self.settings.sidebar_organization {
                         SidebarOrganization::ByDevice => Some((chat.device_id.clone(), device)),
-                        SidebarOrganization::ByProject | SidebarOrganization::InOneList => None,
+                        SidebarOrganization::ByProject
+                        | SidebarOrganization::InOneList
+                        | SidebarOrganization::ByWorktree => None,
                     };
                     ActiveChatRow {
                         status,
@@ -1253,6 +1367,7 @@ impl Shell {
                         branch,
                         change_request,
                         group,
+                        tree,
                     }
                 })
                 .collect()
@@ -1266,6 +1381,9 @@ impl Shell {
             for row in &mut rows {
                 row.change_request = None;
             }
+        }
+        if self.settings.sidebar_organization == SidebarOrganization::ByWorktree {
+            return self.render_worktree_tree(rows, theme, cx);
         }
 
         let mut groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
@@ -1301,6 +1419,7 @@ impl Shell {
                     branch,
                     change_request,
                     group: _,
+                    tree: _,
                 } = row;
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
@@ -1334,6 +1453,7 @@ impl Shell {
                     status,
                     is_selected,
                     false,
+                    false,
                     jump_label,
                     None,
                     theme,
@@ -1348,7 +1468,9 @@ impl Shell {
             };
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
-                SidebarOrganization::ByProject | SidebarOrganization::InOneList => "list",
+                SidebarOrganization::ByProject
+                | SidebarOrganization::InOneList
+                | SidebarOrganization::ByWorktree => "list",
             };
             let collapse_key = format!("{organization}:{key}");
             let motion_key = format!("group:{collapse_key}");
@@ -1410,6 +1532,319 @@ impl Shell {
             rendered.push((format!("g:{collapse_key}"), height, element));
         }
         rendered
+    }
+
+    /// Projects & worktrees (the Orca-style tree): a collapsible row per
+    /// project, a header per worktree (status, branch, pull request), and
+    /// that worktree's sessions as one-line rows beneath it. Each project is
+    /// one keyed item, so a resort glides whole projects.
+    fn render_worktree_tree(
+        &mut self,
+        rows: Vec<ActiveChatRow>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, f32, AnyElement)> {
+        let now = Utc::now();
+        let selected = self.state.read(cx).selected_chat.clone();
+        let jump_hints = self.jump_hints && !self.overlay_owns_keyboard(cx);
+        let keymap = self.settings.keymap.clone();
+        // Same flat slot order `sidebar_visible_order` hands the jump keys.
+        let mut slot = 0usize;
+        let mut rendered = Vec::new();
+        let projects = group_by_first_appearance(rows, |row| row.tree.project_key.clone());
+        for (index, (project_key, rows)) in projects.into_iter().enumerate() {
+            let project = rows[0].tree.project.clone();
+            let device = rows[0].tree.device.clone();
+            let session_count = rows.len();
+            let working = rows.iter().any(|row| row.status == ChatIndicator::Working);
+
+            let worktrees = group_by_first_appearance(rows, |row| row.tree.worktree_key.clone());
+            let worktree_count = worktrees.len();
+            let mut blocks = Vec::with_capacity(worktree_count);
+            let mut body_height = SIDEBAR_DISCLOSURE_BODY_INSET
+                + SIDEBAR_TREE_WORKTREE_GAP * worktree_count.saturating_sub(1) as f32;
+            for (worktree_key, rows) in worktrees {
+                let header = self.render_worktree_header(
+                    format!("{project_key}/{worktree_key}"),
+                    rows[0].tree.worktree.clone().into(),
+                    worktree_status(rows.iter().map(|row| row.status)),
+                    rows.iter()
+                        .any(|row| row.status == ChatIndicator::Completed),
+                    rows.iter().find_map(|row| row.change_request.clone()),
+                    rows[0].chat.id.clone(),
+                    theme,
+                    cx,
+                );
+                body_height += SIDEBAR_TREE_WORKTREE_HEADER_HEIGHT
+                    + rows.len() as f32 * (SIDEBAR_LIST_GAP + SIDEBAR_TREE_CHAT_ROW_HEIGHT);
+                let mut children = Vec::with_capacity(rows.len() + 1);
+                children.push(header);
+                for row in rows {
+                    let chat = row.chat;
+                    let jump_label: Option<SharedString> = if jump_hints {
+                        let combo = keymap.get(ShortcutId::JumpSession(slot));
+                        (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
+                    } else {
+                        None
+                    };
+                    slot += 1;
+                    let harness = self
+                        .settings
+                        .sidebar_show_harness
+                        .then(|| chat.config.as_ref().map(|c| c.harness))
+                        .flatten();
+                    children.push(
+                        self.render_chat_row(
+                            chat.id.clone(),
+                            transcript::single_line(
+                                &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                            )
+                            .into(),
+                            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                                .into(),
+                            SharedString::default(),
+                            None,
+                            None,
+                            harness,
+                            row.status,
+                            selected.as_deref() == Some(chat.id.as_str()),
+                            false,
+                            true,
+                            jump_label,
+                            None,
+                            theme,
+                            cx,
+                        ),
+                    );
+                }
+                blocks.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .gap(px(SIDEBAR_LIST_GAP))
+                        .children(children),
+                );
+            }
+
+            let collapse_key = format!("project:{project_key}");
+            let motion_key = format!("group:{collapse_key}");
+            let collapsed = self.sidebar_collapsed_groups.contains(&collapse_key);
+            let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
+            let toggle_key = collapse_key.clone();
+            let toggle_motion_key = motion_key.clone();
+            let header = self
+                .render_project_header(
+                    &collapse_key,
+                    project.into(),
+                    device.map(SharedString::from),
+                    session_count,
+                    working,
+                    chevron,
+                    theme,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
+                    this.begin_sidebar_disclosure_motion(
+                        &toggle_motion_key,
+                        if was_open { body_height } else { 0.0 },
+                        if was_open { 0.0 } else { body_height },
+                    );
+                    if was_open {
+                        this.sidebar_collapsed_groups.insert(toggle_key.clone());
+                    } else {
+                        this.sidebar_collapsed_groups.remove(&toggle_key);
+                    }
+                    cx.notify();
+                }));
+            let body = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(SIDEBAR_DISCLOSURE_BODY_INSET))
+                .gap(px(SIDEBAR_TREE_WORKTREE_GAP))
+                .children(blocks);
+            let body = self.render_sidebar_disclosure_body(
+                &motion_key,
+                !collapsed,
+                body_height,
+                body.into_any_element(),
+            );
+            let top_gap = if index == 0 {
+                0.0
+            } else {
+                SIDEBAR_TREE_PROJECT_GAP
+            };
+            let height = top_gap
+                + SIDEBAR_DISCLOSURE_HEADER_HEIGHT
+                + if collapsed { 0.0 } else { body_height };
+            let element = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pt(px(top_gap))
+                .child(header)
+                .child(body)
+                .into_any_element();
+            rendered.push((format!("p:{project_key}"), height, element));
+        }
+        rendered
+    }
+
+    /// A project row in the tree: chevron, folder name, "@ device", and the
+    /// session count, with the live glyph while any of its sessions works.
+    #[allow(clippy::too_many_arguments)]
+    fn render_project_header(
+        &self,
+        key: &str,
+        project: SharedString,
+        device: Option<SharedString>,
+        session_count: usize,
+        working: bool,
+        chevron: AnyElement,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let hover = theme.glass_hover();
+        let subline = theme.text_muted.opacity(0.5);
+        div()
+            .id(SharedString::from(format!("sidebar-{key}")))
+            .h(px(SIDEBAR_DISCLOSURE_HEADER_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .child(chevron)
+            .child(super::sidebar_faded_label(
+                format!("sidebar-{key}-label").into(),
+                true,
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text.opacity(0.85))
+                            .child(project),
+                    )
+                    .when_some(device, |el, device| {
+                        el.child(
+                            div()
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .text_color(theme.text_muted.opacity(0.45))
+                                .child(SharedString::from(format!("@ {device}"))),
+                        )
+                    }),
+            ))
+            .when(working, |el| {
+                el.child(loaders::mini_glyph_spinner(
+                    format!("sidebar-{key}-working"),
+                    2.0,
+                    theme.glyph,
+                    self.sidebar_pane.entity_id(),
+                    cx,
+                ))
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(subline)
+                    .child(SharedString::from(session_count.to_string())),
+            )
+    }
+
+    /// A worktree header in the tree: its most urgent status, the branch
+    /// (bold while a session in it finished unseen), and the pull request.
+    /// Clicking it opens the worktree's most recent session.
+    #[allow(clippy::too_many_arguments)]
+    fn render_worktree_header(
+        &self,
+        key: String,
+        branch: SharedString,
+        status: ChatIndicator,
+        unread: bool,
+        change_request: Option<zeron_proto::ChangeRequestSummary>,
+        open_chat: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover = theme.glass_hover();
+        let glyph: AnyElement = if status == ChatIndicator::Working {
+            loaders::mini_glyph_spinner(
+                format!("sidebar-worktree-{key}-working"),
+                2.0,
+                theme.glyph,
+                self.sidebar_pane.entity_id(),
+                cx,
+            )
+            .into_any_element()
+        } else {
+            div()
+                .size(px(6.0))
+                .rounded_full()
+                .bg(status_dot_color(status, theme))
+                .into_any_element()
+        };
+        let label_color = if unread {
+            theme.text
+        } else {
+            theme.text_muted.opacity(0.75)
+        };
+        div()
+            .id(SharedString::from(format!("sidebar-worktree-{key}")))
+            .h(px(SIDEBAR_TREE_WORKTREE_HEADER_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(SIDEBAR_ACTIVE_HARNESS_TITLE_GAP))
+            .pl(px(Theme::SPACE_SM + SIDEBAR_TREE_INDENT))
+            .pr(px(Theme::SPACE_SM))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_chat(open_chat.clone(), cx);
+            }))
+            // Same column as the harness marks below, so status and identity
+            // line up down the tree.
+            .child(
+                div()
+                    .w(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(glyph),
+            )
+            .child(super::sidebar_faded_label(
+                format!("sidebar-worktree-{key}-label").into(),
+                true,
+                div()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .line_height(px(16.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_color(label_color)
+                    .when(unread, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
+                    .child(branch),
+            ))
+            .when_some(change_request, |el, summary| {
+                el.child(crate::change_requests::pull_request_badge_with_query(
+                    format!("sidebar-worktree-{key}-pr").into(),
+                    summary,
+                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                    None,
+                    theme,
+                ))
+            })
+            .into_any_element()
     }
 
     /// The sidebar's archived shelf — a direct port of t3code's settled
@@ -3085,7 +3520,10 @@ impl Shell {
 mod tests {
     use chrono::{TimeZone as _, Utc};
 
-    use super::{compare_sidebar_chats, promote_local_device_group};
+    use super::{
+        SidebarTreeKeys, compare_sidebar_chats, group_by_first_appearance,
+        promote_local_device_group, worktree_status,
+    };
     use crate::settings::SidebarSort;
 
     fn group(device: &str, value: u8) -> (Option<(String, String)>, Vec<u8>) {
@@ -3147,6 +3585,63 @@ mod tests {
         promote_local_device_group(&mut groups, Some("not-present"));
 
         assert_eq!(groups, before);
+    }
+
+    #[test]
+    fn tree_groups_keep_first_appearance_order() {
+        let items = [
+            ("zeron", 1),
+            ("comet", 2),
+            ("zeron", 3),
+            ("pi", 4),
+            ("comet", 5),
+        ];
+
+        let groups = group_by_first_appearance(items, |(project, _)| *project);
+
+        let shape: Vec<_> = groups
+            .iter()
+            .map(|(key, members)| (*key, members.iter().map(|(_, n)| *n).collect::<Vec<_>>()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("zeron", vec![1, 3]),
+                ("comet", vec![2, 5]),
+                ("pi", vec![4])
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_wears_its_most_urgent_session_status() {
+        use zeron_proto::ChatIndicator::*;
+        assert_eq!(worktree_status([Idle, Working, Completed]), Working);
+        assert_eq!(worktree_status([Completed, Errored, Working]), Errored);
+        assert_eq!(worktree_status([Errored, AwaitingInput]), AwaitingInput);
+        assert_eq!(worktree_status(std::iter::empty()), Idle);
+    }
+
+    #[test]
+    fn chats_group_by_checkout_then_branch_then_folder() {
+        let mut stamped = chat("stamped");
+        stamped.space_id = Some("space".into());
+        stamped.checkout_id = Some("checkout-1".into());
+        let keys = SidebarTreeKeys::new(&stamped, "zeron".into(), None, Some("feat/tree"));
+        assert_eq!(keys.project_key, "space");
+        assert_eq!(keys.worktree_key, "checkout-1");
+        assert_eq!(keys.worktree, "feat/tree");
+
+        let branch_only = chat("branch-only");
+        let keys = SidebarTreeKeys::new(&branch_only, "~".into(), None, Some("main"));
+        assert_eq!(keys.project_key, "~");
+        assert_eq!(keys.worktree_key, "branch:main");
+
+        let mut folder_only = chat("folder-only");
+        folder_only.cwd = Some("/src/app".into());
+        let keys = SidebarTreeKeys::new(&folder_only, "app".into(), None, None);
+        assert_eq!(keys.worktree_key, "cwd:/src/app");
+        assert_eq!(keys.worktree, "Local checkout");
     }
 }
 
